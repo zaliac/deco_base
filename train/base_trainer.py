@@ -4,8 +4,8 @@ import torch
 import numpy as np
 from vis.visualize import gen_render
 
-
-def trainer(epoch, train_loader, solver, hparams, compute_metrics=False):
+# def trainer(epoch, train_loader, solver, hparams, compute_metrics=False):
+def trainer(epoch, train_loader, solver, hparams, compute_metrics=False, writer=None):
 
     total_epochs = hparams.TRAINING.NUM_EPOCHS
     print('Training Epoch {}/{}'.format(epoch, total_epochs))
@@ -14,10 +14,23 @@ def trainer(epoch, train_loader, solver, hparams, compute_metrics=False):
     iterator = tqdm(enumerate(train_loader), total=length, leave=False, desc=f'Training Epoch: {epoch}/{total_epochs}')
     for step, batch in iterator:
         losses, output = solver.optimize(batch)
+
+        # log training losses to tensorboard
+        if writer is not None:
+            # compute a global step number; you can choose another scheme if you prefer
+            global_step = (epoch - 1) * length + step
+            for k, v in losses.items():
+                # v is a tensor or scalar-like
+                try:
+                    writer.add_scalar(f'train/{k}', v.item(), global_step)
+                except Exception:
+                    # fallback if v is numpy scalar
+                    writer.add_scalar(f'train/{k}', float(v), global_step)
     return losses, output
 
 @torch.no_grad()
-def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', normalize=True, return_dict=False):
+# def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', normalize=True, return_dict=False):
+def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', normalize=True, return_dict=False, writer=None):
     total_epochs = hparams.TRAINING.NUM_EPOCHS
 
     batch_size = val_loader.batch_size
@@ -98,6 +111,30 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
     total_time /= dataset_size
 
     val_epoch_cont_loss = np.sum(val_epoch_cont_loss) / dataset_size
+
+    # Log evaluation metrics to tensorboard
+    if writer is not None:
+        # scalar metrics
+        for k, v in eval_dict.items():
+            if k == 'images':
+                continue
+            try:
+                writer.add_scalar(f'val/{dataset_name}/{k}', float(v), epoch)
+            except Exception:
+                pass
+
+        # images: log up to first few renders as image summaries
+        if 'images' in eval_dict and len(eval_dict['images']) > 0:
+            max_imgs_to_log = 4
+            for i, pil_img in enumerate(eval_dict['images'][:max_imgs_to_log]):
+                # import numpy as np
+                img_arr = np.array(pil_img)  # H x W x C, uint8
+                # transpose to CHW
+                img_chw = img_arr.transpose(2, 0, 1)
+                writer.add_image(f'val/{dataset_name}/render_{i}', img_chw, epoch, dataformats='CHW')
+
+        writer.flush()
+
     if return_dict:
         return eval_dict, total_time
     return eval_dict['cont_f1']
