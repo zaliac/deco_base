@@ -9,10 +9,24 @@ from data.mixed_dataset import MixedDataset
 from models.deco import DECO
 from utils.config import parse_args, run_grid_search_experiments
 
+# add imports
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+import os
+
 def train(hparams):
     deco_model = DECO(hparams.TRAINING.ENCODER, hparams.TRAINING.CONTEXT, device)
 
     solver = TrainStepper(deco_model, hparams.TRAINING.CONTEXT, hparams.OPTIMIZER.LR, hparams.TRAINING.LOSS_WEIGHTS, hparams.TRAINING.PAL_LOSS_WEIGHTS, device)
+
+    # create tensorboard writer
+    tb_log_dir = os.path.join(hparams.OUTPUT_DIR, hparams.EXP_NAME, 'tb_logs',
+                              datetime.now().strftime('%Y%m%d-%H%M%S'))
+    os.makedirs(tb_log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_log_dir)
+
+    # pass writer into TrainStepper (if you kept TrainStepper unchanged, pass writer to trainer/evaluator calls later)
+    # if you choose to attach writer to solver, modify TrainStepper __init__ signature to accept writer and set self.writer = writer
 
     vb_f1 = 0
     start_ep = 0
@@ -25,12 +39,16 @@ def train(hparams):
     
     for epoch in range(start_ep+1, hparams.TRAINING.NUM_EPOCHS + 1):
         # Train one epoch
-        trainer(epoch, train_loader, solver, hparams)
+        # trainer(epoch, train_loader, solver, hparams)
+        trainer(epoch, train_loader, solver, hparams, writer=writer)
         # Run evaluation
         vc_f1 = None
         for val_loader in val_loaders:
             dataset_name = val_loader.dataset.dataset
-            vc_f1_ds = evaluator(val_loader, solver, hparams, epoch, dataset_name, normalize=hparams.DATASET.NORMALIZE_IMAGES)
+            # vc_f1_ds = evaluator(val_loader, solver, hparams, epoch, dataset_name, normalize=hparams.DATASET.NORMALIZE_IMAGES)
+            vc_f1_ds = evaluator(val_loader, solver, hparams, epoch, dataset_name,
+                                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                                 writer=writer)
             if dataset_name == hparams.VALIDATION.MAIN_DATASET:
                 vc_f1 = vc_f1_ds
         if vc_f1 is None:
@@ -63,6 +81,7 @@ def train(hparams):
 
         if k: continue
         else: break
+    writer.close()
 
 
 if __name__ == '__main__':
@@ -94,3 +113,7 @@ if __name__ == '__main__':
     val_loaders = [DataLoader(val_dataset, batch_size=hparams.DATASET.BATCH_SIZE, shuffle=False, num_workers=hparams.DATASET.NUM_WORKERS) for val_dataset in val_datasets]
 
     train(hparams)
+
+
+# tensorboard --logdir deco_results/demo_train/tb_logs
+# # If you used a timestamped folder, point to deco_results/demo_train/tb_logs
