@@ -11,7 +11,7 @@ OPTIMIZER:
   LR: [1e-5]
   NUM_UPDATE_LR: 3
 TRAINING:
-  ENCODER: 'hrnet'
+  ENCODER: 'sam_hrnet'    # 'hrnet'
   CONTEXT: [True]
   NUM_EPOCHS: 30  # 30
   NUM_EARLY_STOP: 10
@@ -22,7 +22,7 @@ TRAINING:
   DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'    # ''
   BEST_MODEL_PATH: './checkpoints/deco_best.pth'
   LOSS_WEIGHTS: 1.
-  PAL_LOSS_WEIGHTS: 0.01
+  PAL_LOSS_WEIGHTS: 0.0   # 0.01
 VALIDATION:
   SUMMARY_STEPS: 5
   DATASETS: ['damon']

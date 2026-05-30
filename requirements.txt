@@ -1,0 +1,27 @@
+# conda create -n deco python=3.10 -y
+# conda activate deco
+# pip install torch==1.13.0+cu117 torchvision==0.14.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
+
+opencv-python
+loguru
+monai==1.0.1
+pyrender==0.1.33
+smplx==0.1.28
+scikit-learn
+scikit-image
+jpeg4py
+matplotlib
+pandas
+configargparse
+flatten_dict
+# chumpy		# pip install --no-build-isolation chumpy==0.70
+numpy==1.23.1
+yacs
+networkx==2.2   # change to 2.2 when use "pip -r requirement.txt" , then: pip install networkx==2.5
+charset-normalizer==3.1.0       # charset_normalizer 3.4.7+computecanada
+#
+tensorboard
+
+
+
+# pip install pytorch-lightning pyrender opencv-python yacs scikit-image einops timm dill pandas rich hydra-core hydra-submitit-launcher hydra-colorlog pyrootutils webdataset chump networkx==3.2.1 roma joblib seaborn wandb appdirs appnope ffmpeg cython jsonlines pytest xtcocotools loguru optree fvcore black pycocotools huggingface_hub

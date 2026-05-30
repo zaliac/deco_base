@@ -4,17 +4,23 @@ import torch
 import numpy as np
 import torch.nn as nn
 
-from pytorch3d.renderer import (
-        PerspectiveCameras,
-        RasterizationSettings,
-        DirectionalLights,
-        BlendParams,
-        HardFlatShader,
-        MeshRasterizer,
-        TexturesVertex,
-        TexturesAtlas
-    )
-from pytorch3d.structures import Meshes
+# NOTE: pytorch3d is imported lazily inside the Pytorch3D renderer (see its
+# __init__/forward), mirroring how NeuralMeshRenderer imports neural_renderer.
+# This lets this module — and utils.loss, which only needs Pytorch3D when the
+# pixel-anchoring loss is active (PAL_LOSS_WEIGHTS > 0) — be imported without
+# pytorch3d installed.
+
+# from pytorch3d.renderer import (
+#         PerspectiveCameras,
+#         RasterizationSettings,
+#         DirectionalLights,
+#         BlendParams,
+#         HardFlatShader,
+#         MeshRasterizer,
+#         TexturesVertex,
+#         TexturesAtlas
+#     )
+# from pytorch3d.structures import Meshes
 
 from .image_utils import get_default_camera
 from .smpl_uv import get_tenet_texture
