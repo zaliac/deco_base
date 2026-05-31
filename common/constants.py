@@ -18,17 +18,17 @@ CONTACT_MAPPING_PATH = 'data/conversions'
 # Path to test/train npz files
 DATASET_FILES = {
     'train': {
-        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_trainval.npz'),
+        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_trainval_with_kpts.npz'),
         'rich': join(DATASET_NPZ_PATH, 'rich/rich_train_smplx_cropped_bmp.npz'),
         'prox': join(DATASET_NPZ_PATH, 'prox/prox_train_smplx_ds4.npz'),
     },
     'val': {
-        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_test.npz'),
+        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_test_with_kpts.npz'),
         'rich': join(DATASET_NPZ_PATH, 'rich/rich_test_smplx_cropped_bmp.npz'),
         'prox': join(DATASET_NPZ_PATH, 'prox/prox_val_smplx_ds4.npz'),
     },
     'test': {
-        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_test.npz'),
+        'damon': join(DATASET_NPZ_PATH, 'damon/hot_dca_test_with_kpts.npz'),
         'rich': join(DATASET_NPZ_PATH, 'rich/rich_test_smplx_cropped_bmp.npz'),
         'prox': join(DATASET_NPZ_PATH, 'prox/prox_val_smplx_ds4.npz'),
     },

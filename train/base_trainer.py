@@ -11,7 +11,7 @@ def trainer(epoch, train_loader, solver, hparams, compute_metrics=False, writer=
     print('Training Epoch {}/{}'.format(epoch, total_epochs))
 
     length = len(train_loader)
-    iterator = tqdm(enumerate(train_loader), total=length, leave=False, desc=f'Training Epoch: {epoch}/{total_epochs}')
+    iterator = tqdm(enumerate(train_loader), total=length, leave=False, desc=f'Tr3aining Epoch: {epoch}/{total_epochs}')
     for step, batch in iterator:
         losses, output = solver.optimize(batch)
 

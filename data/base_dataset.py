@@ -48,6 +48,16 @@ class BaseDataset(Dataset):
         except KeyError:
             self.cam_k = np.zeros((len(self.images), 3, 3))
 
+        # Get 2D keypoint prompts (COCO-17, original-image pixels) + confidence, if available
+        try:
+            self.keypoints_2d = self.data['keypoint_2d']
+            self.keypoint_conf = self.data['keypoint_conf']
+            self.has_keypoints = np.ones(len(self.images))
+        except KeyError:
+            self.keypoints_2d = None
+            self.keypoint_conf = None
+            self.has_keypoints = np.zeros(len(self.images))
+
         self.sem_masks = self.data['scene_seg']
         self.part_masks = self.data['part_seg']
 
@@ -162,6 +172,28 @@ class BaseDataset(Dataset):
         item['part_mask'] = torch.tensor(part_mask, dtype=torch.float32)
         item['polygon_contact_2d'] = torch.tensor(polygon_contact_2d, dtype=torch.float32)
 
+        # 2D keypoint prompts (COCO-17), in ORIGINAL-image pixels, + per-keypoint confidence.
+        # Normalization into the crop and COCO->mhr70 labelling happens in the trainer via
+        # utils.keypoint_prompts.build_keypoint_prompts (it needs img_scale_factor).
+        # Coerce to a fixed (K, 2) / (K,) so the DataLoader can collate. Some samples have
+        # 0 detected keypoints (stored as (0, 2)); missing rows stay zero with confidence 0
+        # (-> marked invalid downstream by build_keypoint_prompts).
+        K = 17
+        kp = np.zeros((K, 2), dtype=np.float32)
+        kpc = np.zeros((K,), dtype=np.float32)
+        n = 0
+        if self.has_keypoints[index]:
+            kp_raw = np.asarray(self.keypoints_2d[index], dtype=np.float32)
+            kpc_raw = np.asarray(self.keypoint_conf[index], dtype=np.float32)
+            if kp_raw.ndim == 2 and kp_raw.shape[1] == 2:
+                n = min(K, kp_raw.shape[0])
+                kp[:n] = kp_raw[:n]
+                m = min(n, kpc_raw.shape[0]) if kpc_raw.ndim == 1 else 0
+                kpc[:m] = kpc_raw[:m]
+        item['keypoints_2d'] = torch.tensor(kp, dtype=torch.float32)
+        item['keypoint_conf'] = torch.tensor(kpc, dtype=torch.float32)
+        item['has_keypoints'] = torch.tensor(1.0 if n > 0 else 0.0, dtype=torch.float32)
+
         item['has_smpl'] = self.has_smpl[index]
         item['is_smplx'] = self.is_smplx[index]
         item['has_contact_3d'] = self.has_contact_3d[index]
@@ -171,3 +203,24 @@ class BaseDataset(Dataset):
 
     def __len__(self):
         return len(self.images)
+
+
+'''
+data:
+[
+'imgname', 
+'pose', 
+'transl', 
+'shape', 
+'cam_k', 
+'polygon_2d_contact', 
+'contact_label', 
+'scene_seg', 
+'part_seg', 
+'contact_label_smplx', 
+'contact_label_objectwise', 
+'contact_label_smplx_objectwise', 
+'keypoint_2d', 
+'keypoint_conf'
+]
+'''

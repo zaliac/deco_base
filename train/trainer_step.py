@@ -1,4 +1,5 @@
 from utils.loss import sem_loss_function, class_loss_function, pixel_anchoring_function
+from utils.keypoint_prompts import build_keypoint_prompts
 import torch
 import os
 import time
@@ -55,9 +56,19 @@ class TrainStepper():
         polygon_contact_2d = batch['polygon_contact_2d'].to(self.device)
         has_polygon_contact_2d = batch['has_polygon_contact_2d'].to(self.device)
 
+        # Build 2D keypoint prompts (COCO-17 -> mhr70) for the SAM-3D-Body encoder.
+        keypoints = None
+        if 'keypoints_2d' in batch:
+            keypoints = build_keypoint_prompts(
+                batch['keypoints_2d'].to(self.device),
+                batch['keypoint_conf'].to(self.device),
+                img_scale_factor,
+                has_keypoints=batch['has_keypoints'].to(self.device),
+            )
+
         # Forward pass
         if self.context:
-            cont, sem_mask_pred, part_mask_pred = self.model(img)
+            cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
         else:
             cont = self.model(img)    
 
@@ -166,10 +177,20 @@ class TrainStepper():
         polygon_contact_2d = batch['polygon_contact_2d'].to(self.device)
         has_polygon_contact_2d = batch['has_polygon_contact_2d'].to(self.device)
 
+        # Build 2D keypoint prompts (COCO-17 -> mhr70) for the SAM-3D-Body encoder.
+        keypoints = None
+        if 'keypoints_2d' in batch:
+            keypoints = build_keypoint_prompts(
+                batch['keypoints_2d'].to(self.device),
+                batch['keypoint_conf'].to(self.device),
+                img_scale_factor,
+                has_keypoints=batch['has_keypoints'].to(self.device),
+            )
+
         # Forward pass
         initial_time = time.time()
-        if self.context: cont, sem_mask_pred, part_mask_pred = self.model(img)
-        else: cont = self.model(img)
+        if self.context: cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
+        else: cont = self.model(img, keypoints)
         time_taken = time.time() - initial_time
 
         if self.context:
@@ -264,7 +285,14 @@ class TrainStepper():
     def load(self, model_path):
         print(f'~~~ Loading existing checkpoint from {model_path} ~~~')
         checkpoint = torch.load(model_path)
-        self.model.load_state_dict(checkpoint['deco'], strict=True)
+        # strict=False so a pre-prompt checkpoint can warm-start the prompt-enabled model:
+        # encoder_part.prompt_encoder.* keys are absent in old checkpoints and keep their
+        # (pretrained, loaded at construction) weights. Surface any other mismatch.
+        missing, unexpected = self.model.load_state_dict(checkpoint['deco'], strict=False)
+        missing = [k for k in missing if not k.startswith('encoder_part.prompt_encoder')]
+        if missing or unexpected:
+            print(f'  [load] unexpected={unexpected[:6]}{"..." if len(unexpected)>6 else ""} '
+                  f'non-prompt missing={missing[:6]}{"..." if len(missing)>6 else ""}')
 
         if self.context:
             self.optimizer_sem.load_state_dict(checkpoint['sem_optim'])

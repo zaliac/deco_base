@@ -94,8 +94,8 @@ class Spatial_Cross_Att(nn.Module):
 
     def forward(self, sem_seg, part_seg):
         # sem tokens attend to part tokens (and vice-versa), each with a residual + norm
-        sem_x, _ = self.attn_sem(sem_seg, part_seg, part_seg)
-        part_x, _ = self.attn_part(part_seg, sem_seg, sem_seg)
+        sem_x, _ = self.attn_sem(sem_seg, part_seg, part_seg)       # , need_weights=False
+        part_x, _ = self.attn_part(part_seg, sem_seg, sem_seg)      # , need_weights=False
         sem_out = self.norm_sem(sem_seg + sem_x)
         part_out = self.norm_part(part_seg + part_x)
         # DECO-style multiplicative fusion of the two streams
@@ -112,7 +112,7 @@ class _VertexDecoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, q, mem):
-        attn_out, _ = self.cross_attn(q, mem, mem)   # vertex queries attend to image tokens
+        attn_out, _ = self.cross_attn(q, mem, mem)   # vertex queries attend to image tokens    # , need_weights=False
         q = self.norm1(q + attn_out)
         q = self.norm2(q + self.ffn(q))
         return q

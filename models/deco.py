@@ -30,7 +30,7 @@ class DECO(nn.Module):
             self.cross_att = Cross_Att(1024, 1024).to(device)
             self.classif = Classifier(1024).to(device)
         elif self.encoder_type == 'sam_hrnet':
-            from models.sam3d_encoder import SAM3DBodyEncoder
+            from models.sam3d_encoder import SAM3DBodyEncoderWithPrompts
 
             # SAM-3D-Body (DINOv3 ViT-H) checkpoint + model_config.yaml + MHR assets.
             sam_ckpt_path = 'data/weights/sam-3d-body-dinov3/model.ckpt'
@@ -45,10 +45,12 @@ class DECO(nn.Module):
             # Adam optimizers; to fine-tune, use a >=24GB GPU and remove the backbone
             # from optimizer_contact in train/trainer_step.py so its Adam state isn't
             # allocated twice.
-            self.encoder_part = SAM3DBodyEncoder(
+            self.encoder_part = SAM3DBodyEncoderWithPrompts(
                 checkpoint_path=sam_ckpt_path,
                 mhr_path=sam_mhr_path,
                 project_to_dim=feature_dim,   # == embed_dim -> no projection
+                use_prompts=True,
+                num_body_joints=70,           # mhr70 prompt-keypoint label space
                 freeze_backbone=True,
                 device=device,
             ).to(device)
@@ -67,7 +69,7 @@ class DECO(nn.Module):
             # instead of global-pooling each branch to a single token. This lets the SAM
             # and HRNet features interact per-location before aggregation, preserving the
             # spatial detail that pooling-to-(B,1,1280) would discard.
-            self.cross_grid = 16
+            self.cross_grid = 16        # 64
             self.cross_att = Spatial_Cross_Att(feature_dim, num_heads=8).to(device)
             # Per-vertex contact head: 6890 learnable vertex queries cross-attend to the
             # fused image tokens (replaces the global-vector MLP). Kept as `self.classif`
@@ -82,7 +84,7 @@ class DECO(nn.Module):
 
         self.device = device
 
-    def forward(self, img):
+    def forward(self, img, keypoints=None):
         if self.encoder_type == 'hrnet':
             sem_enc_out = self.encoder_sem(img)
             part_enc_out = self.encoder_part(img)
@@ -104,8 +106,9 @@ class DECO(nn.Module):
             att = self.cross_att(sem_enc_out, part_enc_out)
             cont = self.classif(att)
         elif self.encoder_type == 'sam_hrnet':
-            # part branch: SAM-3D-Body backbone -> (B, 1280, 16, 16)
-            part_enc_out = self.encoder_part(img)
+            # part branch: SAM-3D-Body backbone -> (B, 1280, 16, 16), plus optional
+            # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
+            part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
             # semantic branch: HRNet -> (B, 480, 64, 64) -> project to (B, 1280, 64, 64)
             sem_enc_out = self.encoder_sem(img)
@@ -123,7 +126,10 @@ class DECO(nn.Module):
             part_tok = F.adaptive_avg_pool2d(part_enc_out, (g, g)).flatten(2).transpose(1, 2) # (B, 256, 1280)
 
             # spatial cross-attention fuses the two modalities into image tokens
-            att = self.cross_att(sem_tok, part_tok)                # (B, 256, 1280)
+            att = self.cross_att(sem_tok, part_tok)                # (B, g*g, 1280)
+            # append the keypoint prompt tokens as extra memory for the contact head
+            if prompt_tokens is not None:
+                att = torch.cat([att, prompt_tokens], dim=1)       # (B, g*g + N, 1280)
             # vertex queries cross-attend to those tokens -> per-vertex contact
             cont = self.classif(att)                               # (B, 6890)
         else:
