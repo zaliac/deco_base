@@ -69,7 +69,7 @@ class DECO(nn.Module):
             # instead of global-pooling each branch to a single token. This lets the SAM
             # and HRNet features interact per-location before aggregation, preserving the
             # spatial detail that pooling-to-(B,1,1280) would discard.
-            self.cross_grid = 16        # 64
+            self.cross_grid = 64        # lowered from 64 to make room for the fp32 backbone (unfreezing)
             self.cross_att = Spatial_Cross_Att(feature_dim, num_heads=8).to(device)
             # Per-vertex contact head: 6890 learnable vertex queries cross-attend to the
             # fused image tokens (replaces the global-vector MLP). Kept as `self.classif`
@@ -122,14 +122,16 @@ class DECO(nn.Module):
             # adaptive_avg_pool is a no-op for the part branch (already 16x16) and pools
             # the HRNet sem branch 64x64 -> 16x16.
             g = self.cross_grid
-            sem_tok = F.adaptive_avg_pool2d(sem_enc_out, (g, g)).flatten(2).transpose(1, 2)   # (B, 256, 1280)
-            part_tok = F.adaptive_avg_pool2d(part_enc_out, (g, g)).flatten(2).transpose(1, 2) # (B, 256, 1280)
+            # sem_tok = F.adaptive_avg_pool2d(sem_enc_out, (g, g)).flatten(2).transpose(1, 2)   # (B, 256, 1280)
+            # part_tok = F.adaptive_avg_pool2d(part_enc_out, (g, g)).flatten(2).transpose(1, 2) # (B, 256, 1280)
+            sem_tok = F.interpolate(sem_enc_out, size=(g, g), mode='bilinear', align_corners=False).flatten(2).transpose(1, 2)   # (B, 4096, 1280)
+            part_tok = F.interpolate(part_enc_out, size=(g, g), mode='bilinear', align_corners=False).flatten(2).transpose(1, 2) # (B, 4096, 1280)
 
             # spatial cross-attention fuses the two modalities into image tokens
-            att = self.cross_att(sem_tok, part_tok)                # (B, g*g, 1280)
+            att = self.cross_att(sem_tok, part_tok)                # (B, g*g, 1280): (B,256,1280) -> (B,4096,1280)
             # append the keypoint prompt tokens as extra memory for the contact head
             if prompt_tokens is not None:
-                att = torch.cat([att, prompt_tokens], dim=1)       # (B, g*g + N, 1280)
+                att = torch.cat([att, prompt_tokens], dim=1)       # (B, g*g + N, 1280): (B,4096+17=4113,1280)
             # vertex queries cross-attend to those tokens -> per-vertex contact
             cont = self.classif(att)                               # (B, 6890)
         else:
