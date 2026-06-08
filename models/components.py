@@ -79,28 +79,60 @@ class Cross_Att(nn.Module):
 class Spatial_Cross_Att(nn.Module):
     """Bidirectional spatial cross-attention between two token sequences.
 
-    Unlike Cross_Att (which collapses each branch to a single token and then mixes the
-    1280 channels), this attends across the H*W spatial locations, so the two feature
-    maps exchange information per-location before aggregation. This keeps the spatial
-    detail that global pooling discards. Inputs / output are (B, N, dim) token tensors.
+    Each stream attends to the other with a residual + norm, so it keeps its own
+    information and only *adds* cross-modal context. The two enriched streams are then
+    concatenated along the token axis and returned as one memory sequence. Unlike the old
+    element-wise product (which gated/entangled the channels and assumed they were
+    aligned), concatenation preserves every token from both modalities and lets the
+    downstream vertex decoder attend over the union and learn what to use. A learned
+    per-stream embedding (zero-init -> starts as a no-op) tags which modality each token
+    came from. The two sequences may differ in length (Ns != Np); output is
+    (B, Ns + Np, in_dim).
+
+    When grid_size G is given (the two streams are co-registered G x G grids, as in the
+    sam_hrnet branch), it also (1) applies a per-stream input LayerNorm -- aligning the ViT
+    (part) and HRNet (sem) feature scales before attention -- and (2) adds a SHARED 2D
+    positional embedding (row + col, zero-init) to both streams, so attention can exploit
+    that sem token (r,c) and part token (r,c) cover the same image region. Requires
+    Ns == Np == G*G in that mode.
     """
-    def __init__(self, in_dim, num_heads=8):
+    def __init__(self, in_dim, num_heads=8, grid_size=None):
         super(Spatial_Cross_Att, self).__init__()
         self.attn_sem = nn.MultiheadAttention(in_dim, num_heads, batch_first=True)
         self.attn_part = nn.MultiheadAttention(in_dim, num_heads, batch_first=True)
         self.norm_sem = nn.LayerNorm(in_dim)
         self.norm_part = nn.LayerNorm(in_dim)
         self.norm_out = nn.LayerNorm(in_dim)
+        self.mod_embed = nn.Parameter(torch.zeros(2, in_dim))   # [sem, part] modality tags
+        self.grid_size = grid_size
+        if grid_size is not None:
+            # input norm aligns the two backbones' feature scales before attention
+            self.norm_in_sem = nn.LayerNorm(in_dim)
+            self.norm_in_part = nn.LayerNorm(in_dim)
+            # shared 2D-factorized positional embedding (zero-init -> no-op at start, like
+            # mod_embed): pos[h,w] = pos_row[h] + pos_col[w], added to BOTH streams so the
+            # co-registered grid locations get a common position signal.
+            self.pos_row = nn.Parameter(torch.zeros(1, grid_size, 1, in_dim))
+            self.pos_col = nn.Parameter(torch.zeros(1, 1, grid_size, in_dim))
 
     def forward(self, sem_seg, part_seg):
+        if self.grid_size is not None:
+            # align the two backbones' feature scales, then add the shared 2D positional
+            # embedding (flattened row-major to match feature_map.flatten(2)) to both grids.
+            sem_seg = self.norm_in_sem(sem_seg)
+            part_seg = self.norm_in_part(part_seg)
+            pos = (self.pos_row + self.pos_col).reshape(1, self.grid_size * self.grid_size, -1)
+            sem_seg = sem_seg + pos
+            part_seg = part_seg + pos
         # sem tokens attend to part tokens (and vice-versa), each with a residual + norm
-        sem_x, _ = self.attn_sem(sem_seg, part_seg, part_seg)       # , need_weights=False
-        part_x, _ = self.attn_part(part_seg, sem_seg, sem_seg)      # , need_weights=False
-        sem_out = self.norm_sem(sem_seg + sem_x)
-        part_out = self.norm_part(part_seg + part_x)
+        sem_x, _ = self.attn_sem(sem_seg, part_seg, part_seg, need_weights=False)
+        part_x, _ = self.attn_part(part_seg, sem_seg, sem_seg, need_weights=False)
+        sem_out = self.norm_sem(sem_seg + sem_x) + self.mod_embed[0]
+        part_out = self.norm_part(part_seg + part_x) + self.mod_embed[1]
         # DECO-style multiplicative fusion of the two streams
-        out = self.norm_out(sem_out * part_out)
-        return out
+        # out = self.norm_out(sem_out * part_out)
+        # concatenate on the token axis -> keeps every token from both streams
+        return torch.cat([sem_out, part_out], dim=1)               # (B, Ns + Np, in_dim)
 
 class _VertexDecoderLayer(nn.Module):
     """One cross-attention + FFN block (no query self-attention)."""

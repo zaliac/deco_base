@@ -18,9 +18,41 @@ class TrainStepper():
             self.optimizer_part = torch.optim.Adam(
                 params=list(self.model.encoder_part.parameters()) + list(self.model.decoder_part.parameters()), lr=learning_rate,
                 weight_decay=0.0001)
+        # hrnet_to_sam (HRNet->SAM adapter) is a top-level submodule, NOT under encoder_sem,
+        # so it must be listed explicitly or it never trains. Only feeds the contact path
+        # (sem_tok -> cross_att -> classif), so it belongs here. Guarded for non-sam_hrnet models.
+        hrnet_to_sam_params = list(self.model.hrnet_to_sam.parameters()) if hasattr(self.model, 'hrnet_to_sam') else []
         self.optimizer_contact = torch.optim.Adam(
             params=list(self.model.encoder_sem.parameters()) + list(self.model.encoder_part.parameters()) + list(
-                self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=learning_rate, weight_decay=0.0001)
+                self.model.cross_att.parameters()) + list(self.model.classif.parameters()) + hrnet_to_sam_params,
+            lr=learning_rate, weight_decay=0.0001)
+
+        # encoder_part param split: the (optionally) unfrozen backbone blocks are fine-tuned
+        # by a dedicated low-LR optimizer; everything else (prompt encoder, projections,
+        # frozen backbone) goes to the task optimizers. Falls back to all params for the plain
+        # CNN/transformer encoders that don't expose the split.
+        # ep = self.model.encoder_part
+        # ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
+        # bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
+        #
+        # if self.context:
+        #     self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
+        #                                         lr=learning_rate, weight_decay=0.0001)
+        #     self.optimizer_part = torch.optim.Adam(
+        #         params=ep_task + list(self.model.decoder_part.parameters()), lr=learning_rate,
+        #         weight_decay=0.0001)
+        # self.optimizer_contact = torch.optim.Adam(
+        #     params=list(self.model.encoder_sem.parameters()) + ep_task + list(
+        #         self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=learning_rate, weight_decay=0.0001)
+        #
+        # Dedicated low-LR optimizer for the unfrozen backbone blocks (None if fully frozen).
+        # self.backbone_lr_scale = 0.1
+        # self.optimizer_backbone = (
+        #     torch.optim.Adam(bb_ft, lr=learning_rate * self.backbone_lr_scale, weight_decay=0.0001)
+        #     if bb_ft else None
+        # )
+        # if bb_ft:
+        #     print(f"✓ backbone fine-tune optimizer: {len(bb_ft)} tensors @ lr={learning_rate * self.backbone_lr_scale:g}")
 
         if self.context: self.sem_loss = sem_loss_function().to(device)
         self.class_loss = class_loss_function().to(device)
@@ -106,6 +138,8 @@ class TrainStepper():
             self.optimizer_sem.zero_grad()
             self.optimizer_part.zero_grad()
         self.optimizer_contact.zero_grad()
+        # if self.optimizer_backbone is not None:
+        #     self.optimizer_backbone.zero_grad()
 
         loss.backward()
 
@@ -113,6 +147,8 @@ class TrainStepper():
             self.optimizer_sem.step()
             self.optimizer_part.step()
         self.optimizer_contact.step()
+        # if self.optimizer_backbone is not None:
+        #     self.optimizer_backbone.step()
 
         if self.context:
             losses = {'sem_loss': loss_sem,
@@ -284,7 +320,7 @@ class TrainStepper():
 
     def load(self, model_path):
         print(f'~~~ Loading existing checkpoint from {model_path} ~~~')
-        checkpoint = torch.load(model_path)
+        checkpoint = torch.load(model_path, weights_only=False)  # trusted local ckpt (has a numpy f1 scalar); torch>=2.6 defaults weights_only=True
         # strict=False so a pre-prompt checkpoint can warm-start the prompt-enabled model:
         # encoder_part.prompt_encoder.* keys are absent in old checkpoints and keep their
         # (pretrained, loaded at construction) weights. Surface any other mismatch.
@@ -294,10 +330,21 @@ class TrainStepper():
             print(f'  [load] unexpected={unexpected[:6]}{"..." if len(unexpected)>6 else ""} '
                   f'non-prompt missing={missing[:6]}{"..." if len(missing)>6 else ""}')
 
+        # Optimizer states may not match if the model's parameters changed (e.g. the
+        # cross_att fusion was restructured: -norm_out, +mod_embed -> contact group size
+        # differs, or backbone fine-tuning splits encoder_part across optimizers). Load
+        # best-effort; on a structure mismatch that optimizer just starts fresh -- the model
+        # weights are already loaded above, so only the Adam moments for the changed group reset.
+        def _try_load_optim(optim, key):
+            try:
+                optim.load_state_dict(checkpoint[key])
+            except (ValueError, KeyError) as e:
+                print(f"  [load] skipped {key} (optimizer structure changed): {str(e)[:80]}")
         if self.context:
-            self.optimizer_sem.load_state_dict(checkpoint['sem_optim'])
-            self.optimizer_part.load_state_dict(checkpoint['part_optim'])
-        self.optimizer_contact.load_state_dict(checkpoint['contact_optim'])
+            _try_load_optim(self.optimizer_sem, 'sem_optim')
+            _try_load_optim(self.optimizer_part, 'part_optim')
+        _try_load_optim(self.optimizer_contact, 'contact_optim')
+
         epoch = checkpoint['epoch']
         f1 = checkpoint['f1']
         return epoch, f1
@@ -314,6 +361,21 @@ class TrainStepper():
         self.optimizer_contact = torch.optim.Adam(
             params=list(self.model.encoder_sem.parameters()) + list(self.model.encoder_part.parameters()) + list(
                 self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=new_lr, weight_decay=0.0001)
+
+        # ep = self.model.encoder_part
+        # ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
+        # bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
+        #
+        # if self.context:
+        #     self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
+        #                                         lr=new_lr, weight_decay=0.0001)
+        #     self.optimizer_part = torch.optim.Adam(
+        #         params=ep_task + list(self.model.decoder_part.parameters()), lr=new_lr, weight_decay=0.0001)
+        # self.optimizer_contact = torch.optim.Adam(
+        #     params=list(self.model.encoder_sem.parameters()) + ep_task + list(
+        #         self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=new_lr, weight_decay=0.0001)
+        # if bb_ft:
+        #     self.optimizer_backbone = torch.optim.Adam(bb_ft, lr=new_lr * self.backbone_lr_scale, weight_decay=0.0001)
 
         print('update learning rate: %f -> %f' % (self.lr, new_lr))
         self.lr = new_lr

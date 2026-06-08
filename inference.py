@@ -25,7 +25,7 @@ def initiate_model(args):
     deco_model = DECO('hrnet', True, device)
 
     logger.info(f'Loading weights from {args.model_path}')
-    checkpoint = torch.load(args.model_path)
+    checkpoint = torch.load(args.model_path, weights_only=False)
     deco_model.load_state_dict(checkpoint['deco'], strict=True)
 
     deco_model.eval()

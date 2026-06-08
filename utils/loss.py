@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from common import constants
 from models.smpl import SMPL
 from smplx import SMPLX
@@ -22,11 +23,14 @@ class sem_loss_function(nn.Module):
 
 
 class class_loss_function(nn.Module):
-    def __init__(self):
+    """Per-vertex contact loss: positive-weighted BCE. DAMON contact is ~13% positive
+    (~6.5:1 imbalance), so plain BCE under-predicts contact (low recall). `pos_weight`
+    upweights the positive (contact) term: 2.5 (~sqrt of the imbalance) is a balanced
+    default; pos_weight=1.0 reduces to plain BCE; higher -> more recall / less precision."""
+    def __init__(self, pos_weight=1.0):
         super(class_loss_function, self).__init__()
         self.ce_loss = nn.BCELoss()
-        # self.ce_loss = nn.MultiLabelSoftMarginLoss()
-        # self.ce_loss = nn.MultiLabelMarginLoss()
+        self.pos_weight =pos_weight #  pos_weight
 
     def forward(self, y_true, y_pred, valid_mask):
         # y_true = torch.squeeze(y_true, 1).long()
@@ -36,10 +40,16 @@ class class_loss_function(nn.Module):
         if bs != 1:
             y_pred = y_pred[valid_mask == 1]
             y_true = y_true[valid_mask == 1]
-        if len(y_pred) > 0:
-            return self.ce_loss(y_pred, y_true)
-        else:
+        # if len(y_pred) > 0:
+        #     return self.ce_loss(y_pred, y_true)
+        # else:
+        #     return torch.tensor(0.0).to(y_pred.device)
+        if len(y_pred) == 0:
             return torch.tensor(0.0).to(y_pred.device)
+        # per-element weight: pos_weight on contact vertices, 1.0 on non-contact
+        p = y_pred.clamp(1e-6, 1.0 - 1e-6)
+        w = 1.0 + (self.pos_weight - 1.0) * y_true
+        return F.binary_cross_entropy(p, y_true, weight=w)
 
 
 class pixel_anchoring_function(nn.Module):

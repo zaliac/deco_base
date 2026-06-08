@@ -52,25 +52,31 @@ class DECO(nn.Module):
                 use_prompts=True,
                 num_body_joints=70,           # mhr70 prompt-keypoint label space
                 freeze_backbone=True,
+                # unfreeze_last_n_blocks=3,  # fine-tune top 2 ViT blocks (0 disables); low-LR via TrainStepper
                 device=device,
             ).to(device)
 
             # encoder_sem: HRNet -> (B, 480, 64, 64); 1x1 conv projects 480 -> 1280
+            # self.encoder_sem = Encoder(encoder='hrnet').to(device)
+            # self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=1).to(device)
+            # encoder_sem: HRNet -> (B, 480, 64, 64); strided conv projects 480 -> 1280
+            # AND downsamples 64x64 -> 16x16 (learnable 4x4 pooling) to align with the SAM grid
             self.encoder_sem = Encoder(encoder='hrnet').to(device)
-            self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=1).to(device)
+            self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=4, stride=4).to(device)
 
             if self.context:
-                # decoder_sem decodes the (B,1280,64,64) HRNet map  -> x4  -> (B,133,256,256)
-                self.decoder_sem = Decoder(feature_dim, 133, encoder='hrnet').to(device)
+                # decoder_sem decodes the (B,1280,16,16) projected HRNet map -> x16 -> (B,133,256,256)
+                self.decoder_sem = Decoder(feature_dim, 133, encoder='sam_vit').to(device)
+                # self.decoder_sem = Decoder(480, 133, encoder='hrnet').to(device)
                 # decoder_part decodes the (B,1280,16,16) SAM map   -> x16 -> (B,26,256,256)
                 self.decoder_part = Decoder(feature_dim, 26, encoder='sam_vit').to(device)
 
-            # Spatial cross-attention over a common 16x16 token grid (256 tokens),
-            # instead of global-pooling each branch to a single token. This lets the SAM
-            # and HRNet features interact per-location before aggregation, preserving the
-            # spatial detail that pooling-to-(B,1,1280) would discard.
-            self.cross_grid = 64        # lowered from 64 to make room for the fp32 backbone (unfreezing)
-            self.cross_att = Spatial_Cross_Att(feature_dim, num_heads=8).to(device)
+            # Spatial cross-attention over the per-location tokens of each branch (not a
+            # single global-pooled token), so the SAM and HRNet features interact per
+            # location before aggregation, preserving spatial detail. Both branches are on
+            # the same 16x16 grid (sem downsampled by hrnet_to_sam), so grid_size=16 turns on
+            # per-stream input norm + a shared 2D positional embedding inside the fusion.
+            self.cross_att = Spatial_Cross_Att(feature_dim, num_heads=8, grid_size=16).to(device)
             # Per-vertex contact head: 6890 learnable vertex queries cross-attend to the
             # fused image tokens (replaces the global-vector MLP). Kept as `self.classif`
             # so TrainStepper's optimizer_contact (model.classif.parameters()) still
@@ -110,28 +116,34 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: HRNet -> (B, 480, 64, 64) -> project to (B, 1280, 64, 64)
-            sem_enc_out = self.encoder_sem(img)
-            sem_enc_out = self.hrnet_to_sam(sem_enc_out)
+            # semantic branch: HRNet -> (B, 480, 64, 64) -> project + downsample to (B, 1280, 16, 16)
+            sem_enc_out = self.encoder_sem(img)                 # (B, 480, 64, 64)
+            sem_enc_out_new = self.hrnet_to_sam(sem_enc_out)    # (B, 1280, 16, 16) learnable downsample
 
             if self.context:
-                sem_mask_pred = self.decoder_sem(sem_enc_out)      # (B, 133, 256, 256)
+                sem_mask_pred = self.decoder_sem(sem_enc_out_new)  # (B,1280,16,16) -> (B,133,256,256)
+                # sem_mask_pred = self.decoder_sem(sem_enc_out)       # (B, 480, 64, 64) -> (B,133,256,256)
                 part_mask_pred = self.decoder_part(part_enc_out)   # (B, 26, 256, 256)
 
-            # bring both maps to a common g x g grid and flatten to (B, g*g, 1280) tokens.
-            # adaptive_avg_pool is a no-op for the part branch (already 16x16) and pools
-            # the HRNet sem branch 64x64 -> 16x16.
-            g = self.cross_grid
-            # sem_tok = F.adaptive_avg_pool2d(sem_enc_out, (g, g)).flatten(2).transpose(1, 2)   # (B, 256, 1280)
-            # part_tok = F.adaptive_avg_pool2d(part_enc_out, (g, g)).flatten(2).transpose(1, 2) # (B, 256, 1280)
-            sem_tok = F.interpolate(sem_enc_out, size=(g, g), mode='bilinear', align_corners=False).flatten(2).transpose(1, 2)   # (B, 4096, 1280)
-            part_tok = F.interpolate(part_enc_out, size=(g, g), mode='bilinear', align_corners=False).flatten(2).transpose(1, 2) # (B, 4096, 1280)
+            # Tokenize both branches at their native 16x16. part (SAM) is the primary signal
+            # (256 tokens). sem (HRNet) was projected AND downsampled 64x64 -> 16x16 by the
+            # learnable strided conv self.hrnet_to_sam, so the 4x4 -> 1 spatial reduction is a
+            # learned weighted combination (not a blunt avg-pool) and the two branches align
+            # 1:1. The conv hard-codes the 64 -> 16 ratio, so assert the grids match in case
+            # the SAM/HRNet resolutions ever change. (Cross-attention does not require equal
+            # lengths, so sem could instead be kept at higher res -- at more memory tokens.)
+            Hp, Wp = part_enc_out.shape[-2:]
+            assert sem_enc_out_new.shape[-2:] == (Hp, Wp), \
+                f"sem grid {tuple(sem_enc_out_new.shape[-2:])} != part grid {(Hp, Wp)}; adjust hrnet_to_sam stride"
+            sem_tok = sem_enc_out_new.flatten(2).transpose(1, 2)   # (B, 256, 1280)
+            part_tok = part_enc_out.flatten(2).transpose(1, 2)     # (B, 256, 1280)
 
-            # spatial cross-attention fuses the two modalities into image tokens
-            att = self.cross_att(sem_tok, part_tok)                # (B, g*g, 1280): (B,256,1280) -> (B,4096,1280)
+            # bidirectional cross-attention; returns BOTH enriched streams concatenated on
+            # the token axis -> (B, 256+256, 1280), preserving every token from both modalities.
+            att = self.cross_att(sem_tok, part_tok)                # (B, 512, 1280)
             # append the keypoint prompt tokens as extra memory for the contact head
             if prompt_tokens is not None:
-                att = torch.cat([att, prompt_tokens], dim=1)       # (B, g*g + N, 1280): (B,4096+17=4113,1280)
+                att = torch.cat([att, prompt_tokens], dim=1)       # (B, 512 + N, 1280)
             # vertex queries cross-attend to those tokens -> per-vertex contact
             cont = self.classif(att)                               # (B, 6890)
         else:
