@@ -13,6 +13,7 @@ import pyrender
 
 from models.deco import DECO
 from common import constants
+from utils.ttt import ttt_predict, load_lr_mirror_index, collect_ttt_params
 
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 
@@ -140,6 +141,14 @@ def main(args):
 
     deco_model = initiate_model(args)
     
+    ttt_state = None
+    if args.ttt:
+        mirror_idx, paired_mask = load_lr_mirror_index(constants.SMPL_MODEL_DIR, device=device)
+        ttt_params = collect_ttt_params(deco_model)
+        logger.info(f'TTT enabled: adapting {len(ttt_params)} param tensor(s), '
+                    f'{args.ttt_steps} step(s) @ lr={args.ttt_lr}')
+        ttt_state = (mirror_idx, paired_mask, ttt_params)
+
     smpl_path = os.path.join(constants.SMPL_MODEL_DIR, 'smpl_neutral_tpose.ply')
     
     for img_name in images:
@@ -149,7 +158,13 @@ def main(args):
         img = img[np.newaxis,:,:,:]
         img = torch.tensor(img, dtype = torch.float32).to(device)
 
-        cont, _, _ = deco_model(img)
+        if ttt_state is not None:
+            mirror_idx, paired_mask, ttt_params = ttt_state
+            cont = ttt_predict(deco_model, img, mirror_idx, paired_mask, params=ttt_params,
+                               steps=args.ttt_steps, lr=args.ttt_lr, verbose=True)
+        else:
+            out = deco_model(img)
+            cont = out[0] if isinstance(out, (tuple, list)) else out
         cont = cont.detach().cpu().numpy().squeeze()
         cont_smpl = []
         for indx, i in enumerate(cont):
@@ -187,6 +202,9 @@ if __name__=='__main__':
     parser.add_argument('--model_path', help='Path to best model weights', default='./checkpoints/Release_Checkpoint/deco_best.pth', type=str)
     parser.add_argument('--mesh_colour', help='Colour of the mesh', nargs='+', type=int, default=[130, 130, 130, 255])
     parser.add_argument('--annot_colour', help='Colour of the mesh', nargs='+', type=int, default=[0, 255, 0, 255])
+    parser.add_argument('--ttt', action='store_true', help='Enable test-time training (per-image L-R flip-consistency adaptation)')
+    parser.add_argument('--ttt_steps', type=int, default=1, help='TTT inner gradient steps per image')
+    parser.add_argument('--ttt_lr', type=float, default=1e-2, help='TTT inner-loop learning rate (SGD)')
     args = parser.parse_args()
 
     main(args)

@@ -26,5 +26,5 @@ data/preprocess/
 models/cliff_hr48/
 models/cliff_res50/
 models/backbones/hrnet/
-vis/
+# vis/
 events.*
