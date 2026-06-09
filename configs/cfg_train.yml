@@ -20,7 +20,7 @@ TRAINING:
   DATASETS: ['damon']
   DATASET_MIX_PDF: ['1.0'] # should sum to 1.0 unless you want to weight by dataset size
   DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'    # ''
-  BEST_MODEL_PATH: './checkpoints/deco_best.pth'
+  BEST_MODEL_PATH: './checkpoints/demo_train_best.pth'
   LOSS_WEIGHTS: 1.
   PAL_LOSS_WEIGHTS: 0.0   # 0.01
 VALIDATION:

@@ -47,12 +47,13 @@ if __name__ == '__main__':
     else:
         device = torch.device('cpu')
 
+    dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
     val_datasets = []
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smplx', normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path, normalize=hparams.DATASET.NORMALIZE_IMAGES))
         elif ds in ['damon']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smpl', normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path, normalize=hparams.DATASET.NORMALIZE_IMAGES))
         else:
             raise ValueError('Dataset not supported')
 

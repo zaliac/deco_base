@@ -3,7 +3,7 @@ PROJECT_NAME: 'DECO_DAMON_Testing'
 OUTPUT_DIR: 'deco_results'
 CONDOR_DIR: ''
 DATASET:
-  BATCH_SIZE: 16
+  BATCH_SIZE: 1
   NUM_WORKERS: 4
   NORMALIZE_IMAGES: [True]
 OPTIMIZER:
@@ -11,7 +11,7 @@ OPTIMIZER:
   LR: [5e-5]
   NUM_UPDATE_LR: 3
 TRAINING:
-  ENCODER: 'hrnet'
+  ENCODER: 'sam_hrnet'
   CONTEXT: [True]
   NUM_EPOCHS: 1
   NUM_EARLY_STOP: 10
@@ -19,10 +19,13 @@ TRAINING:
   CHECKPOINT_EPOCHS: 5
   DATASETS: ['damon']
   DATASET_MIX_PDF: ['1.']
-  DATASET_ROOT_PATH: ''
-  BEST_MODEL_PATH: './checkpoints/Release_Checkpoint/deco_best.pth'
+  DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'
+  BEST_MODEL_PATH: './checkpoints/demo_train_best.pth'
   PAL_LOSS_WEIGHTS: 0.0
 VALIDATION:
   SUMMARY_STEPS: 1000
   DATASETS: ['damon']
   MAIN_DATASET: 'damon'
+  TTT: True
+  TTT_STEPS: 5
+  TTT_LR: 0.01
