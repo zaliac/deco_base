@@ -13,6 +13,7 @@ so it never duplicates the 840M ViT. Photometric augmentation preserves geometry
 supervised contact/keypoint labels stay valid on the student view.
 """
 import copy
+import types
 
 import torch
 import torch.nn as nn
@@ -77,6 +78,84 @@ def attn_consistency_loss(student_attn, teacher_attn):
 
 
 # ---------------------------------------------------------------------------
+# backbone self-attention SSL: tap the DINOv3 ViT and distill it across two views
+# ---------------------------------------------------------------------------
+# The SAM-3D-Body backbone is a DINOv3 ViT whose SelfAttention uses a FUSED
+# F.scaled_dot_product_attention (the QKᵀ map is never materialized) and applies RoPE to
+# q,k inside compute_attention. We can't edit the (torch.hub) source, so we monkey-patch
+# compute_attention on the *unfrozen top-N* blocks: when capture is on it reproduces the
+# exact op (reusing the module's own apply_rope) via the math path so we can read out the
+# attention map (Q,K) and the attention output context (Q,K,V); when off it calls the
+# original fused SDPA path unchanged (byte-identical, zero overhead).
+def tap_dinov3_attention(attn, prefix):
+    """Install the capture wrapper on one DINOv3 `SelfAttention` module (idempotent).
+
+    When `attn.capture_attn` is True the forward stashes (for the patch tokens only --
+    `prefix` cls+storage tokens are dropped so the two geometry-preserving views align 1:1):
+        attn.last_ctx  : (B, P, C)  attention output softmax(QKᵀ)·V  -- uses Q,K AND V
+        attn.last_attn : (B, P, N)  patch-query attention map (rows sum to 1 over all keys),
+                                     only when `attn.capture_map` is True (materializes BxHxNxN)."""
+    if getattr(attn, '_orig_compute_attention', None) is not None:
+        attn._attn_prefix = prefix                         # already tapped; just refresh prefix
+        return
+    attn._orig_compute_attention = attn.compute_attention
+    attn._attn_prefix = prefix
+    attn.capture_attn = False
+    attn.capture_map = False
+    attn.last_attn = None
+    attn.last_ctx = None
+
+    def compute_attention(self, qkv, attn_bias=None, rope=None):
+        if not self.capture_attn:
+            return self._orig_compute_attention(qkv, attn_bias=attn_bias, rope=rope)
+        p = self._attn_prefix
+        B, N, _ = qkv.shape
+        C = self.qkv.in_features
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))   # each (B, heads, N, head_dim)
+        if rope is not None:
+            q, k = self.apply_rope(q, k, rope)             # the SAME rotation the model applies
+        if self.capture_map:
+            # math path == SDPA with no mask/dropout; fp32 for a stable softmax + KL target.
+            a = (q.float() * self.scale) @ k.float().transpose(-2, -1)      # (B, heads, N, N)
+            a = a.softmax(dim=-1)
+            out = (a.to(v.dtype) @ v).transpose(1, 2).reshape(B, N, C)
+            self.last_attn = a[:, :, p:, :].mean(1)                         # (B, P, N) patch-query, head-avg
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v) # keep the fused fast path
+            out = out.transpose(1, 2).reshape(B, N, C)
+            self.last_attn = None
+        self.last_ctx = out[:, p:, :]                                       # (B, P, C)
+        return out
+
+    attn.compute_attention = types.MethodType(compute_attention, attn)
+
+
+def set_backbone_capture(attn_modules, capture, capture_map=False):
+    """Toggle capture on the tapped backbone attention modules (off => original SDPA path)."""
+    for m in attn_modules:
+        m.capture_attn = capture
+        m.capture_map = bool(capture and capture_map)
+
+
+def backbone_attn_distill(student_maps, teacher_maps, student_ctx, teacher_ctx, map_w=0.0, ctx_w=1.0):
+    """Cross-view self-distillation on the unfrozen backbone blocks (student = strong view,
+    teacher = weak view, detached). Returns the ALREADY-WEIGHTED sum:
+        ctx term: mean over blocks of 1 - cos(student_out, sg(teacher_out))   (uses Q,K,V)
+        map term: KL(teacher_map || student_map) over keys                    (uses Q,K)
+    Photometric aug preserves geometry, so patch tokens align 1:1 -- no remapping."""
+    ctx = student_ctx[0].new_zeros(())
+    for so, to in zip(student_ctx, teacher_ctx):
+        ctx = ctx + (1.0 - F.cosine_similarity(so, to.detach(), dim=-1)).mean()
+    ctx = ctx / max(len(student_ctx), 1)
+    loss = ctx_w * ctx
+    if map_w > 0 and student_maps and student_maps[0] is not None:
+        loss = loss + map_w * attn_consistency_loss(tuple(student_maps), tuple(teacher_maps))
+    return loss
+
+
+# ---------------------------------------------------------------------------
 # EMA teacher (shares the frozen backbone to avoid duplicating the ViT)
 # ---------------------------------------------------------------------------
 def build_teacher(student, share_prefix='encoder_part'):
@@ -95,7 +174,12 @@ def build_teacher(student, share_prefix='encoder_part'):
     if shared is not None:
         setattr(teacher, share_prefix, shared)               # teacher shares the same backbone module
     teacher.eval()
-    for p in teacher.parameters():
+    # Freeze the teacher's OWN params, but NOT the shared submodule: it's the student's module
+    # (e.g. encoder_part), so flipping its requires_grad here would silently re-freeze the
+    # student's unfrozen backbone blocks. The teacher runs it under no_grad anyway.
+    for name, p in teacher.named_parameters():
+        if share_prefix and name.startswith(share_prefix):
+            continue
         p.requires_grad_(False)
     return teacher
 

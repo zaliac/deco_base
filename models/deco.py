@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 
 class DECO(nn.Module):
-    def __init__(self, encoder, context, device):
+    def __init__(self, encoder, context, device, backbone_unfreeze_n=0):
         super(DECO, self).__init__()
         self.encoder_type = encoder
         self.context = context
@@ -52,7 +52,7 @@ class DECO(nn.Module):
                 use_prompts=True,
                 num_body_joints=70,           # mhr70 prompt-keypoint label space
                 freeze_backbone=True,
-                # unfreeze_last_n_blocks=3,  # fine-tune top 2 ViT blocks (0 disables); low-LR via TrainStepper
+                unfreeze_last_n_blocks=backbone_unfreeze_n,  # fine-tune top-N DINOv3 blocks (0 disables); low-LR via TrainStepper
                 device=device,
             ).to(device)
 

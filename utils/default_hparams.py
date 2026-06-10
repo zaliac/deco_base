@@ -46,6 +46,12 @@ hparams.TRAINING.EMA_MOMENTUM = 0.996          # teacher EMA momentum
 hparams.TRAINING.DINO_TEACHER_TEMP = 0.04
 hparams.TRAINING.DINO_STUDENT_TEMP = 0.1
 hparams.TRAINING.DINO_CENTER_MOMENTUM = 0.9
+# Self-supervised task on the DINOv3 ViT backbone's self-attention (uses Q,K,V). Requires
+# BACKBONE_UNFREEZE_N>0 (gradients must reach the qkv proj) and DISTILL=True (reuses the
+# two-view EMA-teacher pipeline). See utils/distill.py:tap_dinov3_attention.
+hparams.TRAINING.BACKBONE_UNFREEZE_N = 0             # fine-tune the top-N backbone blocks (0 = fully frozen)
+hparams.TRAINING.DISTILL_BACKBONE_ATTN_WEIGHT = 0.0  # cross-view consistency on the attention OUTPUT softmax(QKᵀ)V (uses Q,K,V); 0 = off
+hparams.TRAINING.DISTILL_BACKBONE_MAP_WEIGHT = 0.0   # cross-view KL on the explicit QKᵀ attention MAP (uses Q,K); 0 = off (higher memory)
 
 # Training hparams
 hparams.VALIDATION = CN()

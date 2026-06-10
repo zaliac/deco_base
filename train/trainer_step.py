@@ -4,7 +4,8 @@ import torch
 import os
 import time
 from utils.distill import (build_teacher, ema_update, two_views, DINOHead, DINOLoss,
-                           FeatureGrabber, attn_consistency_loss)
+                           FeatureGrabber, attn_consistency_loss,
+                           tap_dinov3_attention, set_backbone_capture, backbone_attn_distill)
 
 
 class TrainStepper():
@@ -14,47 +15,39 @@ class TrainStepper():
         self.model = deco_model
         self.context = context
 
+        # encoder_part param split: the (optionally) unfrozen top-N backbone blocks are fine-tuned
+        # by a dedicated low-LR optimizer (self.optimizer_backbone); everything else (prompt
+        # encoder, projections, frozen backbone) goes to the task optimizers via task_parameters().
+        # This keeps the unfrozen blocks OUT of optimizer_part/contact so their Adam state isn't
+        # allocated twice. Falls back to all params for the plain CNN/transformer encoders.
+        ep = self.model.encoder_part
+        ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
+        bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
+
         if self.context:
-            self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
-                                                lr=learning_rate, weight_decay=0.0001)
+            self.optimizer_sem = torch.optim.Adam(
+                params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
+                lr=learning_rate, weight_decay=0.0001)
             self.optimizer_part = torch.optim.Adam(
-                params=list(self.model.encoder_part.parameters()) + list(self.model.decoder_part.parameters()), lr=learning_rate,
-                weight_decay=0.0001)
-        # hrnet_to_sam (HRNet->SAM adapter) is a top-level submodule, NOT under encoder_sem,
-        # so it must be listed explicitly or it never trains. Only feeds the contact path
-        # (sem_tok -> cross_att -> classif), so it belongs here. Guarded for non-sam_hrnet models.
+                params=ep_task + list(self.model.decoder_part.parameters()),
+                lr=learning_rate, weight_decay=0.0001)
+        # hrnet_to_sam (HRNet->SAM adapter) is a top-level submodule, NOT under encoder_sem, so it
+        # must be listed explicitly or it never trains. Only feeds the contact path
+        # (sem_tok -> cross_att -> classif). Guarded for non-sam_hrnet models.
         hrnet_to_sam_params = list(self.model.hrnet_to_sam.parameters()) if hasattr(self.model, 'hrnet_to_sam') else []
         self.optimizer_contact = torch.optim.Adam(
-            params=list(self.model.encoder_sem.parameters()) + list(self.model.encoder_part.parameters()) + list(
-                self.model.cross_att.parameters()) + list(self.model.classif.parameters()) + hrnet_to_sam_params,
+            params=list(self.model.encoder_sem.parameters()) + ep_task + list(self.model.cross_att.parameters())
+                   + list(self.model.classif.parameters()) + hrnet_to_sam_params,
             lr=learning_rate, weight_decay=0.0001)
 
-        # encoder_part param split: the (optionally) unfrozen backbone blocks are fine-tuned
-        # by a dedicated low-LR optimizer; everything else (prompt encoder, projections,
-        # frozen backbone) goes to the task optimizers. Falls back to all params for the plain
-        # CNN/transformer encoders that don't expose the split.
-        # ep = self.model.encoder_part
-        # ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
-        # bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
-        #
-        # if self.context:
-        #     self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
-        #                                         lr=learning_rate, weight_decay=0.0001)
-        #     self.optimizer_part = torch.optim.Adam(
-        #         params=ep_task + list(self.model.decoder_part.parameters()), lr=learning_rate,
-        #         weight_decay=0.0001)
-        # self.optimizer_contact = torch.optim.Adam(
-        #     params=list(self.model.encoder_sem.parameters()) + ep_task + list(
-        #         self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=learning_rate, weight_decay=0.0001)
-        #
-        # Dedicated low-LR optimizer for the unfrozen backbone blocks (None if fully frozen).
-        # self.backbone_lr_scale = 0.1
-        # self.optimizer_backbone = (
-        #     torch.optim.Adam(bb_ft, lr=learning_rate * self.backbone_lr_scale, weight_decay=0.0001)
-        #     if bb_ft else None
-        # )
-        # if bb_ft:
-        #     print(f"✓ backbone fine-tune optimizer: {len(bb_ft)} tensors @ lr={learning_rate * self.backbone_lr_scale:g}")
+        # Dedicated low-LR optimizer for the unfrozen top-N backbone blocks (None if fully frozen).
+        self.backbone_lr_scale = 0.1
+        self.optimizer_backbone = (
+            torch.optim.Adam(bb_ft, lr=learning_rate * self.backbone_lr_scale, weight_decay=0.0001)
+            if bb_ft else None
+        )
+        if bb_ft:
+            print(f"✓ backbone fine-tune optimizer: {len(bb_ft)} tensors @ lr={learning_rate * self.backbone_lr_scale:g}")
 
         if self.context: self.sem_loss = sem_loss_function().to(device)
         self.class_loss = class_loss_function().to(device)
@@ -66,16 +59,24 @@ class TrainStepper():
         self.distill = False
 
     def enable_distill(self, out_dim=4096, dino_weight=1.0, out_weight=1.0, attn_weight=0.0,
-                       ema_momentum=0.996, teacher_temp=0.04, student_temp=0.1, center_momentum=0.9):
+                       ema_momentum=0.996, teacher_temp=0.04, student_temp=0.1, center_momentum=0.9,
+                       backbone_attn_weight=0.0, backbone_map_weight=0.0):
         """Turn on DINO-style teacher-student self-distillation during optimize() (utils/distill.py).
         Builds an EMA teacher that SHARES the frozen SAM backbone, student+teacher DINO heads and
-        the DINO loss, and adds the student head to optimizer_contact so it trains."""
+        the DINO loss, and adds the student head to optimizer_contact so it trains.
+
+        backbone_attn_weight / backbone_map_weight (>0) additionally turn on the self-supervised
+        task on the DINOv3 backbone's self-attention: the unfrozen top-N blocks' attention is made
+        consistent across the two views (student strong vs teacher weak). Requires unfrozen blocks
+        (BACKBONE_UNFREEZE_N>0) -- otherwise no gradient reaches the qkv proj and it's a no-op."""
         from common import constants
         self.distill = True
         self.ema_momentum = ema_momentum
         self.dino_weight = dino_weight
         self.out_weight = out_weight
         self.attn_weight = attn_weight
+        self.backbone_attn_weight = backbone_attn_weight
+        self.backbone_map_weight = backbone_map_weight
         self.img_mean = torch.tensor(constants.IMG_NORM_MEAN, device=self.device).view(1, 3, 1, 1)
         self.img_std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
         mp = getattr(self.model.classif, 'mem_proj', None)
@@ -86,9 +87,25 @@ class TrainStepper():
         self.dino_loss = DINOLoss(out_dim, teacher_temp, student_temp, center_momentum).to(self.device)
         self.student_feat = FeatureGrabber(self.model.classif)
         self.teacher_feat = FeatureGrabber(self.teacher.classif)
-        if attn_weight > 0 and hasattr(self.model, 'cross_att'):    # attention-consistency regularizer
+        if attn_weight > 0 and hasattr(self.model, 'cross_att'):    # fusion attention-consistency regularizer
             self.model.cross_att.capture_attn = True
             self.teacher.cross_att.capture_attn = True
+        # Backbone self-attention SSL: tap the unfrozen top-N DINOv3 blocks. The teacher SHARES
+        # encoder_part, so these are the same modules for both views -- tapping once covers both.
+        self._bb_attn_taps = []
+        if backbone_attn_weight > 0 or backbone_map_weight > 0:
+            if hasattr(ep := self.model.encoder_part, 'finetuned_attn_modules'):
+                mods = ep.finetuned_attn_modules()
+                for m in mods:
+                    tap_dinov3_attention(m, ep.backbone_token_prefix)
+                self._bb_attn_taps = mods
+                if not mods:
+                    print('! backbone-attn SSL requested but no unfrozen blocks (set BACKBONE_UNFREEZE_N>0)')
+                else:
+                    print(f'✓ backbone-attn SSL: {len(mods)} blocks, attn_w={backbone_attn_weight}, '
+                          f'map_w={backbone_map_weight}, prefix={ep.backbone_token_prefix}')
+            else:
+                print('! backbone-attn SSL requested but encoder has no finetuned_attn_modules()')
         self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
         print(f'✓ Distillation ON: DINO out_dim={out_dim}, dino_w={dino_weight}, out_w={out_weight}, '
               f'attn_w={attn_weight}, ema={ema_momentum}, feat_dim={feat_dim}')
@@ -136,11 +153,26 @@ class TrainStepper():
         if getattr(self, 'distill', False):
             teacher_img, student_img = two_views(img, self.img_mean, self.img_std)
 
+        # Backbone self-attention SSL: turn capture ON for the tapped top-N blocks so this
+        # forward (student / strong view) stashes the attention map + output context.
+        bb_taps = getattr(self, '_bb_attn_taps', [])
+        do_bb_attn = (getattr(self, 'distill', False) and bb_taps
+                      and (self.backbone_attn_weight > 0 or self.backbone_map_weight > 0))
+        if do_bb_attn:
+            set_backbone_capture(bb_taps, True, capture_map=self.backbone_map_weight > 0)
+
         # Forward pass
         if self.context:
             cont, sem_mask_pred, part_mask_pred = self.model(student_img, keypoints)
         else:
             cont = self.model(student_img)
+
+        # Snapshot the student (strong-view) attention BEFORE the teacher forward overwrites it
+        # on the same (shared) modules. These keep their grad (student is the trainable side).
+        student_bb_maps = student_bb_ctx = None
+        if do_bb_attn:
+            student_bb_maps = [m.last_attn for m in bb_taps]
+            student_bb_ctx = [m.last_ctx for m in bb_taps]
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
@@ -174,13 +206,19 @@ class TrainStepper():
 
         # Teacher-student distillation: feature DINO (on the pooled fused features) + output
         # consistency (on the contact probs). The teacher runs on the weak view under no_grad.
-        loss_dino = loss_out = loss_attn = None
+        loss_dino = loss_out = loss_attn = loss_bb_attn = None
         if getattr(self, 'distill', False):
             student_feat = self.student_feat.feat                       # captured by the hook in forward
+            teacher_bb_maps = teacher_bb_ctx = None
             with torch.no_grad():
-                t_out = self.teacher(teacher_img, keypoints)
+                t_out = self.teacher(teacher_img, keypoints)            # weak view; overwrites tap state
                 teacher_cont = t_out[0] if isinstance(t_out, (tuple, list)) else t_out
                 teacher_logits = self.teacher_dino_head(self.teacher_feat.feat)
+                if do_bb_attn:                                         # detached weak-view targets
+                    teacher_bb_maps = [m.last_attn for m in bb_taps]
+                    teacher_bb_ctx = [m.last_ctx for m in bb_taps]
+            if do_bb_attn:
+                set_backbone_capture(bb_taps, False)                   # back to the fused SDPA path
             loss_dino = self.dino_loss(self.student_dino_head(student_feat), teacher_logits)
             loss_out = ((cont - teacher_cont) ** 2).mean()
             loss = loss + self.dino_weight * loss_dino + self.out_weight * loss_out
@@ -189,13 +227,21 @@ class TrainStepper():
                 loss_attn = attn_consistency_loss(self.model.cross_att.last_attn,
                                                   self.teacher.cross_att.last_attn)
                 loss = loss + self.attn_weight * loss_attn
+            # self-supervised task on the DINOv3 backbone's self-attention (uses Q,K,V): make the
+            # unfrozen top blocks' attention consistent across the two views (already-weighted).
+            if do_bb_attn:
+                loss_bb_attn = backbone_attn_distill(student_bb_maps, teacher_bb_maps,
+                                                     student_bb_ctx, teacher_bb_ctx,
+                                                     map_w=self.backbone_map_weight,
+                                                     ctx_w=self.backbone_attn_weight)
+                loss = loss + loss_bb_attn
 
         if self.context:
             self.optimizer_sem.zero_grad()
             self.optimizer_part.zero_grad()
         self.optimizer_contact.zero_grad()
-        # if self.optimizer_backbone is not None:
-        #     self.optimizer_backbone.zero_grad()
+        if self.optimizer_backbone is not None:
+            self.optimizer_backbone.zero_grad()
 
         loss.backward()
 
@@ -203,8 +249,8 @@ class TrainStepper():
             self.optimizer_sem.step()
             self.optimizer_part.step()
         self.optimizer_contact.step()
-        # if self.optimizer_backbone is not None:
-        #     self.optimizer_backbone.step()
+        if self.optimizer_backbone is not None:
+            self.optimizer_backbone.step()
 
         # EMA-update the teacher (skip the shared frozen backbone) and the teacher DINO head.
         if getattr(self, 'distill', False):
@@ -225,8 +271,10 @@ class TrainStepper():
         if loss_dino is not None:                          # distillation diagnostics (for logging)
             losses['dino_loss'] = loss_dino
             losses['out_loss'] = loss_out
-            if loss_attn is not None:                      # mean attention-consistency KL
+            if loss_attn is not None:                      # mean fusion attention-consistency KL
                 losses['attn_loss'] = loss_attn
+            if loss_bb_attn is not None:                   # backbone self-attention SSL (ctx + map)
+                losses['bb_attn_loss'] = loss_bb_attn
 
         if self.context:
             output = {
@@ -371,7 +419,8 @@ class TrainStepper():
                 'f1': f1,
                 'sem_optim': self.optimizer_sem.state_dict(),
                 'part_optim': self.optimizer_part.state_dict(),
-                'contact_optim': self.optimizer_contact.state_dict()
+                'contact_optim': self.optimizer_contact.state_dict(),
+                'backbone_optim': self.optimizer_backbone.state_dict() if self.optimizer_backbone is not None else None
             },
                 model_path)
         else:
@@ -381,7 +430,8 @@ class TrainStepper():
                 'f1': f1,
                 'sem_optim': self.optimizer_sem.state_dict(),
                 'part_optim': self.optimizer_part.state_dict(),
-                'contact_optim': self.optimizer_contact.state_dict()
+                'contact_optim': self.optimizer_contact.state_dict(),
+                'backbone_optim': self.optimizer_backbone.state_dict() if self.optimizer_backbone is not None else None
             },
                 model_path)    
 
@@ -411,6 +461,10 @@ class TrainStepper():
             _try_load_optim(self.optimizer_sem, 'sem_optim')
             _try_load_optim(self.optimizer_part, 'part_optim')
         _try_load_optim(self.optimizer_contact, 'contact_optim')
+        # backbone optimizer only exists when top-N blocks are unfrozen; absent/None in older or
+        # frozen-backbone checkpoints -> just start its Adam moments fresh.
+        if self.optimizer_backbone is not None and checkpoint.get('backbone_optim') is not None:
+            _try_load_optim(self.optimizer_backbone, 'backbone_optim')
 
         epoch = checkpoint['epoch']
         f1 = checkpoint['f1']
@@ -420,29 +474,30 @@ class TrainStepper():
         if factor:
             new_lr = self.lr / factor
 
-        if self.context:
-            self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
-                                                lr=new_lr, weight_decay=0.0001)
-            self.optimizer_part = torch.optim.Adam(
-                params=list(self.model.encoder_part.parameters()) + list(self.model.decoder_part.parameters()), lr=new_lr, weight_decay=0.0001)
-        self.optimizer_contact = torch.optim.Adam(
-            params=list(self.model.encoder_sem.parameters()) + list(self.model.encoder_part.parameters()) + list(
-                self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=new_lr, weight_decay=0.0001)
+        # Mirror __init__'s task/backbone split so the unfrozen top-N blocks keep their dedicated
+        # low-LR optimizer instead of being folded back into the task optimizers at full LR.
+        ep = self.model.encoder_part
+        ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
+        bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
+        hrnet_to_sam_params = list(self.model.hrnet_to_sam.parameters()) if hasattr(self.model, 'hrnet_to_sam') else []
 
-        # ep = self.model.encoder_part
-        # ep_task = list(ep.task_parameters()) if hasattr(ep, 'task_parameters') else list(ep.parameters())
-        # bb_ft = list(ep.backbone_finetune_parameters()) if hasattr(ep, 'backbone_finetune_parameters') else []
-        #
-        # if self.context:
-        #     self.optimizer_sem = torch.optim.Adam(params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
-        #                                         lr=new_lr, weight_decay=0.0001)
-        #     self.optimizer_part = torch.optim.Adam(
-        #         params=ep_task + list(self.model.decoder_part.parameters()), lr=new_lr, weight_decay=0.0001)
-        # self.optimizer_contact = torch.optim.Adam(
-        #     params=list(self.model.encoder_sem.parameters()) + ep_task + list(
-        #         self.model.cross_att.parameters()) + list(self.model.classif.parameters()), lr=new_lr, weight_decay=0.0001)
-        # if bb_ft:
-        #     self.optimizer_backbone = torch.optim.Adam(bb_ft, lr=new_lr * self.backbone_lr_scale, weight_decay=0.0001)
+        if self.context:
+            self.optimizer_sem = torch.optim.Adam(
+                params=list(self.model.encoder_sem.parameters()) + list(self.model.decoder_sem.parameters()),
+                lr=new_lr, weight_decay=0.0001)
+            self.optimizer_part = torch.optim.Adam(
+                params=ep_task + list(self.model.decoder_part.parameters()), lr=new_lr, weight_decay=0.0001)
+        self.optimizer_contact = torch.optim.Adam(
+            params=list(self.model.encoder_sem.parameters()) + ep_task + list(self.model.cross_att.parameters())
+                   + list(self.model.classif.parameters()) + hrnet_to_sam_params,
+            lr=new_lr, weight_decay=0.0001)
+        self.optimizer_backbone = (
+            torch.optim.Adam(bb_ft, lr=new_lr * self.backbone_lr_scale, weight_decay=0.0001) if bb_ft else None
+        )
+        # optimizer_contact was rebuilt from scratch, so re-attach the (distillation) DINO head
+        # param group or it would silently stop training after the first LR drop.
+        if getattr(self, 'student_dino_head', None) is not None:
+            self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
 
         print('update learning rate: %f -> %f' % (self.lr, new_lr))
         self.lr = new_lr

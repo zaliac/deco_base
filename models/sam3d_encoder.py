@@ -28,7 +28,7 @@ class SAM3DBodyEncoderWithPrompts(nn.Module):
             use_prompts=True,
             num_body_joints=70,
             freeze_backbone=True,
-            # unfreeze_last_n_blocks=1,
+            unfreeze_last_n_blocks=0,
             freeze_prompt_encoder=False,
             device='cuda',
     ):
@@ -99,33 +99,38 @@ class SAM3DBodyEncoderWithPrompts(nn.Module):
                 param.requires_grad = False
             print("✓ SAM-3D-Body backbone frozen")
 
-        # Partially unfreeze the last N transformer blocks (+ final norm) so the top of the
-        # backbone adapts to contact while the rest stays frozen. The backbone runs in bf16,
-        # which fine-tunes without a grad scaler; only these blocks store activations / get
-        # gradients (the ViT runs on 256 tokens), so the memory overhead is small. Train them
-        # with a *small* LR -- TrainStepper puts them in a dedicated optimizer (lr x 0.1).
-        # self.unfreeze_last_n_blocks = int(unfreeze_last_n_blocks or 0)
-        # if self.unfreeze_last_n_blocks > 0:
-        #     enc = self.backbone.encoder
-        #     blocks = getattr(enc, "blocks", None)
-        #     if blocks is None:
-        #         print("! backbone has no .blocks; cannot partially unfreeze (staying frozen)")
-        #     else:
-        #         n = min(self.unfreeze_last_n_blocks, len(blocks))
-        #         for blk in list(blocks)[-n:]:
-        #             for param in blk.parameters():
-        #                 param.requires_grad = True
-        #         if hasattr(enc, "norm"):          # final norm feeds the output features
-        #             for param in enc.norm.parameters():
-        #                 param.requires_grad = True
-        #
-        #         # bf16 weights can't absorb the small fine-tuning updates (they underflow the
-        #         # ~7-bit mantissa and round to zero), so cast the whole backbone to fp32 for
-        #         # trainable fine-tuning. ~+1.7GB -> pair with a smaller cross_grid / batch on 12GB.
-        #         self.backbone.float()
-        #         self.backbone_dtype = torch.float32
-        #         print("✓ Backbone cast to fp32 for fine-tuning")
-        #         print(f"✓ Unfroze last {n}/{len(blocks)} SAM-3D-Body backbone blocks (+ final norm)")
+        # Partially unfreeze the top-N DINOv3 transformer blocks (+ final norm) so the top of
+        # the backbone adapts to contact (and to any backbone-attention SSL task) while the rest
+        # stays frozen. The backbone is a Dinov3Backbone whose ViT lives at backbone.encoder, so
+        # the blocks are backbone.encoder.blocks (NOT backbone.blocks). Train them with a *small*
+        # LR -- TrainStepper puts them in a dedicated optimizer (lr x 0.1).
+        self.unfreeze_last_n_blocks = int(unfreeze_last_n_blocks or 0)
+        self._ft_attn_modules = []
+        if self.unfreeze_last_n_blocks > 0:
+            enc = getattr(self.backbone, "encoder", None)
+            blocks = getattr(enc, "blocks", None)
+            if blocks is None:
+                print("! backbone has no .encoder.blocks; cannot partially unfreeze (staying frozen)")
+            else:
+                # bf16 weights can't absorb the small fine-tuning updates (they underflow the
+                # ~7-bit mantissa and round to zero), so cast the WHOLE backbone to fp32 (mixing
+                # dtypes across the residual stream would break the frozen->unfrozen boundary).
+                # ~+1.7GB -> pair with a smaller cross_grid / batch on 12GB.
+                self.backbone.float()
+                self.backbone_dtype = torch.float32
+                n = min(self.unfreeze_last_n_blocks, len(blocks))
+                for blk in list(blocks)[-n:]:
+                    for param in blk.parameters():
+                        param.requires_grad = True
+                    attn = getattr(blk, "attn", None)
+                    if attn is not None:
+                        self._ft_attn_modules.append(attn)   # exposed for the SSL attention tap
+                for norm_name in ("norm", "cls_norm"):       # final norm(s) feed the output features
+                    norm_mod = getattr(enc, norm_name, None)
+                    if norm_mod is not None:
+                        for param in norm_mod.parameters():
+                            param.requires_grad = True
+                print(f"✓ Backbone cast to fp32; unfroze last {n}/{len(blocks)} DINOv3 blocks (+ final norm)")
 
         if self.use_prompts and freeze_prompt_encoder:
             for param in self.prompt_encoder.parameters():
@@ -145,6 +150,18 @@ class SAM3DBodyEncoderWithPrompts(nn.Module):
         ft = set(id(p) for p in self.backbone_finetune_parameters())
         return [p for p in self.parameters() if id(p) not in ft]
 
+    def finetuned_attn_modules(self):
+        """The DINOv3 SelfAttention modules of the unfrozen top-N blocks. Empty if frozen.
+        The backbone-attention SSL task taps these (utils/distill.py:tap_dinov3_attention)."""
+        return list(self._ft_attn_modules)
+
+    @property
+    def backbone_token_prefix(self):
+        """#(cls + storage) tokens before the patch tokens in the DINOv3 sequence -- dropped
+        from the attention query axis so only patch tokens (which align across views) compare."""
+        enc = getattr(self.backbone, "encoder", None)
+        return int(getattr(enc, "n_storage_tokens", 0)) + 1 if enc is not None else 1
+
     def forward(self, x, keypoints=None):
         """
         Args:
@@ -158,12 +175,12 @@ class SAM3DBodyEncoderWithPrompts(nn.Module):
                 a 256x256 input with patch_size 16. C == embed_dim unless a projection is set.
             prompt_tokens: (B, N, C) sparse prompt tokens, or None when no keypoints given.
         """
-        # The DINOv3/ViT backbone already returns a spatial map (B, C, Hp, Wp).
-        # backbone_ctx = (
-        #     contextlib.nullcontext() if self._backbone_trainable else torch.no_grad()
-        # )
+        # The DINOv3 backbone already returns a spatial map (B, C, Hp, Wp). Run it WITH autograd
+        # iff some of its params are trainable (top-N blocks unfrozen); else no_grad. The frozen
+        # lower blocks build no backward graph (their params/inputs don't require grad), so the
+        # activation memory cost is only the unfrozen top-N blocks.
         backbone_ctx = (
-            torch.no_grad() if self.freeze_backbone else contextlib.nullcontext()
+            contextlib.nullcontext() if self._backbone_trainable else torch.no_grad()
         )
         with backbone_ctx:
             feat = self.backbone(x.to(self.backbone_dtype))     # (B, 1280, 16, 16)

@@ -15,7 +15,8 @@ from datetime import datetime
 import os
 
 def train(hparams):
-    deco_model = DECO(hparams.TRAINING.ENCODER, hparams.TRAINING.CONTEXT, device)
+    deco_model = DECO(hparams.TRAINING.ENCODER, hparams.TRAINING.CONTEXT, device,
+                      backbone_unfreeze_n=getattr(hparams.TRAINING, 'BACKBONE_UNFREEZE_N', 0))
 
     solver = TrainStepper(deco_model, hparams.TRAINING.CONTEXT, hparams.OPTIMIZER.LR, hparams.TRAINING.LOSS_WEIGHTS, hparams.TRAINING.PAL_LOSS_WEIGHTS, device)
 
@@ -45,7 +46,9 @@ def train(hparams):
                               ema_momentum=hparams.TRAINING.EMA_MOMENTUM,
                               teacher_temp=hparams.TRAINING.DINO_TEACHER_TEMP,
                               student_temp=hparams.TRAINING.DINO_STUDENT_TEMP,
-                              center_momentum=hparams.TRAINING.DINO_CENTER_MOMENTUM)
+                              center_momentum=hparams.TRAINING.DINO_CENTER_MOMENTUM,
+                              backbone_attn_weight=getattr(hparams.TRAINING, 'DISTILL_BACKBONE_ATTN_WEIGHT', 0.0),
+                              backbone_map_weight=getattr(hparams.TRAINING, 'DISTILL_BACKBONE_MAP_WEIGHT', 0.0))
 
     for epoch in range(start_ep+1, hparams.TRAINING.NUM_EPOCHS + 1):
         # Train one epoch
