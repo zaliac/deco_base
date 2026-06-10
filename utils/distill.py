@@ -64,6 +64,18 @@ class DINOLoss(nn.Module):
         self.center.mul_(self.center_momentum).add_(batch_center, alpha=1 - self.center_momentum)
 
 
+def attn_consistency_loss(student_attn, teacher_attn):
+    """KL between the fusion's attention maps on the two augmented views (teacher = detached
+    target). Photometric aug preserves geometry, so the maps align 1:1 (no remapping). Each of
+    student_attn / teacher_attn is a tuple (a_sem, a_part) of (B, N_q, N_k) row-softmax maps."""
+    loss = 0.0
+    for s, t in zip(student_attn, teacher_attn):
+        t = t.detach().clamp_min(1e-8)
+        s = s.clamp_min(1e-8)
+        loss = loss + (t * (t.log() - s.log())).sum(-1).mean()      # KL(teacher || student) over keys
+    return loss / max(len(student_attn), 1)
+
+
 # ---------------------------------------------------------------------------
 # EMA teacher (shares the frozen backbone to avoid duplicating the ViT)
 # ---------------------------------------------------------------------------

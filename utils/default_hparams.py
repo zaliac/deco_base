@@ -40,6 +40,7 @@ hparams.TRAINING.PAL_LOSS_WEIGHTS = 1.
 hparams.TRAINING.DISTILL = False               # DINO teacher-student self-distillation (utils/distill.py)
 hparams.TRAINING.DISTILL_DINO_WEIGHT = 1.0     # weight on the feature-DINO loss
 hparams.TRAINING.DISTILL_OUT_WEIGHT = 1.0      # weight on the output-consistency loss
+hparams.TRAINING.DISTILL_ATTN_WEIGHT = 0.0     # weight on the fusion attention-consistency loss (0 = off)
 hparams.TRAINING.DISTILL_OUT_DIM = 4096        # DINO prototype count
 hparams.TRAINING.EMA_MOMENTUM = 0.996          # teacher EMA momentum
 hparams.TRAINING.DINO_TEACHER_TEMP = 0.04

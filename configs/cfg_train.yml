@@ -24,7 +24,7 @@ TRAINING:
   LOSS_WEIGHTS: 1.
   PAL_LOSS_WEIGHTS: 0.0   # 0.01
   DISTILL: True
-  DISTILL_DINO_WEIGHT: 0.5     # start modest; ramp up if stable
+  DISTILL_DINO_WEIGHT: 0.2  # 0.5     # start modest; ramp up if stable   # 0 = off; the new attention-consistency term
   DISTILL_OUT_WEIGHT: 0.5
   DISTILL_OUT_DIM: 4096
   EMA_MOMENTUM: 0.996

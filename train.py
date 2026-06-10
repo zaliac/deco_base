@@ -41,6 +41,7 @@ def train(hparams):
         solver.enable_distill(out_dim=hparams.TRAINING.DISTILL_OUT_DIM,
                               dino_weight=hparams.TRAINING.DISTILL_DINO_WEIGHT,
                               out_weight=hparams.TRAINING.DISTILL_OUT_WEIGHT,
+                              attn_weight=hparams.TRAINING.DISTILL_ATTN_WEIGHT,
                               ema_momentum=hparams.TRAINING.EMA_MOMENTUM,
                               teacher_temp=hparams.TRAINING.DINO_TEACHER_TEMP,
                               student_temp=hparams.TRAINING.DINO_STUDENT_TEMP,

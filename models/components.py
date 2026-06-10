@@ -124,9 +124,14 @@ class Spatial_Cross_Att(nn.Module):
             pos = (self.pos_row + self.pos_col).reshape(1, self.grid_size * self.grid_size, -1)
             sem_seg = sem_seg + pos
             part_seg = part_seg + pos
-        # sem tokens attend to part tokens (and vice-versa), each with a residual + norm
-        sem_x, _ = self.attn_sem(sem_seg, part_seg, part_seg, need_weights=False)
-        part_x, _ = self.attn_part(part_seg, sem_seg, sem_seg, need_weights=False)
+        # sem tokens attend to part tokens (and vice-versa), each with a residual + norm.
+        # capture_attn (set by the distillation trainer) returns the attention maps for the
+        # attention-consistency regularizer; off by default -> no extra compute.
+        nw = getattr(self, 'capture_attn', False)
+        sem_x, a_sem = self.attn_sem(sem_seg, part_seg, part_seg, need_weights=nw, average_attn_weights=True)
+        part_x, a_part = self.attn_part(part_seg, sem_seg, sem_seg, need_weights=nw, average_attn_weights=True)
+        if nw:
+            self.last_attn = (a_sem, a_part)               # (B, N_q, N_k) each, row-softmax over keys
         sem_out = self.norm_sem(sem_seg + sem_x) + self.mod_embed[0]
         part_out = self.norm_part(part_seg + part_x) + self.mod_embed[1]
         # DECO-style multiplicative fusion of the two streams

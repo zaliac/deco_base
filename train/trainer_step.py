@@ -3,7 +3,8 @@ from utils.keypoint_prompts import build_keypoint_prompts
 import torch
 import os
 import time
-from utils.distill import build_teacher, ema_update, two_views, DINOHead, DINOLoss, FeatureGrabber
+from utils.distill import (build_teacher, ema_update, two_views, DINOHead, DINOLoss,
+                           FeatureGrabber, attn_consistency_loss)
 
 
 class TrainStepper():
@@ -64,8 +65,8 @@ class TrainStepper():
         self.pal_loss_weight = pal_loss_weight
         self.distill = False
 
-    def enable_distill(self, out_dim=4096, dino_weight=1.0, out_weight=1.0, ema_momentum=0.996,
-                       teacher_temp=0.04, student_temp=0.1, center_momentum=0.9):
+    def enable_distill(self, out_dim=4096, dino_weight=1.0, out_weight=1.0, attn_weight=0.0,
+                       ema_momentum=0.996, teacher_temp=0.04, student_temp=0.1, center_momentum=0.9):
         """Turn on DINO-style teacher-student self-distillation during optimize() (utils/distill.py).
         Builds an EMA teacher that SHARES the frozen SAM backbone, student+teacher DINO heads and
         the DINO loss, and adds the student head to optimizer_contact so it trains."""
@@ -74,6 +75,7 @@ class TrainStepper():
         self.ema_momentum = ema_momentum
         self.dino_weight = dino_weight
         self.out_weight = out_weight
+        self.attn_weight = attn_weight
         self.img_mean = torch.tensor(constants.IMG_NORM_MEAN, device=self.device).view(1, 3, 1, 1)
         self.img_std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
         mp = getattr(self.model.classif, 'mem_proj', None)
@@ -84,9 +86,12 @@ class TrainStepper():
         self.dino_loss = DINOLoss(out_dim, teacher_temp, student_temp, center_momentum).to(self.device)
         self.student_feat = FeatureGrabber(self.model.classif)
         self.teacher_feat = FeatureGrabber(self.teacher.classif)
+        if attn_weight > 0 and hasattr(self.model, 'cross_att'):    # attention-consistency regularizer
+            self.model.cross_att.capture_attn = True
+            self.teacher.cross_att.capture_attn = True
         self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
         print(f'✓ Distillation ON: DINO out_dim={out_dim}, dino_w={dino_weight}, out_w={out_weight}, '
-              f'ema={ema_momentum}, feat_dim={feat_dim}')
+              f'attn_w={attn_weight}, ema={ema_momentum}, feat_dim={feat_dim}')
 
     def optimize(self, batch):
         self.model.train()
@@ -169,6 +174,7 @@ class TrainStepper():
 
         # Teacher-student distillation: feature DINO (on the pooled fused features) + output
         # consistency (on the contact probs). The teacher runs on the weak view under no_grad.
+        loss_dino = loss_out = loss_attn = None
         if getattr(self, 'distill', False):
             student_feat = self.student_feat.feat                       # captured by the hook in forward
             with torch.no_grad():
@@ -178,6 +184,11 @@ class TrainStepper():
             loss_dino = self.dino_loss(self.student_dino_head(student_feat), teacher_logits)
             loss_out = ((cont - teacher_cont) ** 2).mean()
             loss = loss + self.dino_weight * loss_dino + self.out_weight * loss_out
+            # attention-consistency regularizer on the trainable fusion (utils/distill.py)
+            if self.attn_weight > 0 and getattr(self.model.cross_att, 'capture_attn', False):
+                loss_attn = attn_consistency_loss(self.model.cross_att.last_attn,
+                                                  self.teacher.cross_att.last_attn)
+                loss = loss + self.attn_weight * loss_attn
 
         if self.context:
             self.optimizer_sem.zero_grad()
@@ -209,7 +220,13 @@ class TrainStepper():
         else:
             losses = {'cont_loss': loss_cont,
                     'pal_loss': loss_pix_anchoring,
-                    'total_loss': loss}         
+                    'total_loss': loss}
+
+        if loss_dino is not None:                          # distillation diagnostics (for logging)
+            losses['dino_loss'] = loss_dino
+            losses['out_loss'] = loss_out
+            if loss_attn is not None:                      # mean attention-consistency KL
+                losses['attn_loss'] = loss_attn
 
         if self.context:
             output = {
