@@ -37,6 +37,15 @@ def train(hparams):
       _, vb_f1 = solver.load(hparams.TRAINING.BEST_MODEL_PATH)
       start_ep, _ = solver.load(latest_model_path)
     
+    if getattr(hparams.TRAINING, 'DISTILL', False):
+        solver.enable_distill(out_dim=hparams.TRAINING.DISTILL_OUT_DIM,
+                              dino_weight=hparams.TRAINING.DISTILL_DINO_WEIGHT,
+                              out_weight=hparams.TRAINING.DISTILL_OUT_WEIGHT,
+                              ema_momentum=hparams.TRAINING.EMA_MOMENTUM,
+                              teacher_temp=hparams.TRAINING.DINO_TEACHER_TEMP,
+                              student_temp=hparams.TRAINING.DINO_STUDENT_TEMP,
+                              center_momentum=hparams.TRAINING.DINO_CENTER_MOMENTUM)
+
     for epoch in range(start_ep+1, hparams.TRAINING.NUM_EPOCHS + 1):
         # Train one epoch
         # trainer(epoch, train_loader, solver, hparams)

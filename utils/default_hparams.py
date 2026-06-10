@@ -37,6 +37,14 @@ hparams.TRAINING.DATASET_ROOT_PATH = '/is/cluster/work/achatterjee/rich/npzs'
 hparams.TRAINING.BEST_MODEL_PATH = '/is/cluster/work/achatterjee/weights/rich/exp/rich_exp.pth'
 hparams.TRAINING.LOSS_WEIGHTS = 1.
 hparams.TRAINING.PAL_LOSS_WEIGHTS = 1.
+hparams.TRAINING.DISTILL = False               # DINO teacher-student self-distillation (utils/distill.py)
+hparams.TRAINING.DISTILL_DINO_WEIGHT = 1.0     # weight on the feature-DINO loss
+hparams.TRAINING.DISTILL_OUT_WEIGHT = 1.0      # weight on the output-consistency loss
+hparams.TRAINING.DISTILL_OUT_DIM = 4096        # DINO prototype count
+hparams.TRAINING.EMA_MOMENTUM = 0.996          # teacher EMA momentum
+hparams.TRAINING.DINO_TEACHER_TEMP = 0.04
+hparams.TRAINING.DINO_STUDENT_TEMP = 0.1
+hparams.TRAINING.DINO_CENTER_MOMENTUM = 0.9
 
 # Training hparams
 hparams.VALIDATION = CN()
