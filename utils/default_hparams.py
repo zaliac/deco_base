@@ -53,6 +53,17 @@ hparams.TRAINING.BACKBONE_UNFREEZE_N = 0             # fine-tune the top-N backb
 hparams.TRAINING.DISTILL_BACKBONE_ATTN_WEIGHT = 0.0  # cross-view consistency on the attention OUTPUT softmax(QKᵀ)V (uses Q,K,V); 0 = off
 hparams.TRAINING.DISTILL_BACKBONE_MAP_WEIGHT = 0.0   # cross-view KL on the explicit QKᵀ attention MAP (uses Q,K); 0 = off (higher memory)
 
+# DINO teacher-student TEST-TIME ADAPTATION (utils/dino_tta.py), used in tester.py only.
+# Frozen-anchor, episodic: per test batch adapt a small downstream adapt-set to match a fixed
+# teacher across two photometric views, then predict + reset. IN-DOMAIN this is ~a no-op (the
+# model is already augmentation-consistent); the step-0 consistency it prints is the no-op tell.
+hparams.TRAINING.DINO_TTA = False              # turn on DINO test-time adaptation in tester.py
+hparams.TRAINING.DINO_TTA_STEPS = 2            # inner SGD steps per test batch (0 = plain predict)
+hparams.TRAINING.DINO_TTA_LR = 1e-3            # inner-loop SGD lr (small -> episodic stability)
+hparams.TRAINING.DINO_TTA_OUT_WEIGHT = 1.0     # weight on output (contact-prob) consistency MSE
+hparams.TRAINING.DINO_TTA_FEAT_WEIGHT = 1.0    # weight on pooled-feature cosine consistency
+hparams.TRAINING.DINO_TTA_ONLINE = False       # True = keep adapted weights across batches (EMA teacher, CoTTA-style)
+
 # Training hparams
 hparams.VALIDATION = CN()
 hparams.VALIDATION.SUMMARY_STEPS = 100

@@ -57,6 +57,7 @@ class TrainStepper():
         self.loss_weight = loss_weight
         self.pal_loss_weight = pal_loss_weight
         self.distill = False
+        self.dino_tta = None        # DINO teacher-student test-time adaptation (set via enable_dino_tta)
 
     def enable_distill(self, out_dim=4096, dino_weight=1.0, out_weight=1.0, attn_weight=0.0,
                        ema_momentum=0.996, teacher_temp=0.04, student_temp=0.1, center_momentum=0.9,
@@ -109,6 +110,27 @@ class TrainStepper():
         self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
         print(f'✓ Distillation ON: DINO out_dim={out_dim}, dino_w={dino_weight}, out_w={out_weight}, '
               f'attn_w={attn_weight}, ema={ema_momentum}, feat_dim={feat_dim}')
+
+    def enable_dino_tta(self, steps=2, lr=1e-3, out_weight=1.0, feat_weight=1.0,
+                        online=False, ema_momentum=0.999, normalized=True):
+        """Turn on DINO teacher-student test-time adaptation in evaluate() (utils/dino_tta.py).
+
+        Frozen-anchor, episodic by default: per test batch, adapt a small downstream adapt-set for
+        `steps` SGD steps to match a fixed EMA-free teacher across two photometric views, predict on
+        the clean image, then reset. `normalized` must match how the eval images were normalized
+        (DATASET.NORMALIZE_IMAGES) so the photometric augmentation denormalizes correctly.
+
+        IN-DOMAIN this is ~a no-op; watch the step-0 consistency that DinoTTA.report() prints."""
+        from common import constants
+        from utils.dino_tta import DinoTTA
+        if normalized:
+            mean = torch.tensor(constants.IMG_NORM_MEAN, device=self.device).view(1, 3, 1, 1)
+            std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
+        else:                                            # raw [0,1] images: jitter without denorm
+            mean = torch.zeros(1, 3, 1, 1, device=self.device)
+            std = torch.ones(1, 3, 1, 1, device=self.device)
+        self.dino_tta = DinoTTA(self.model, mean, std, steps=steps, lr=lr, out_w=out_weight,
+                                feat_w=feat_weight, online=online, ema_momentum=ema_momentum)
 
     def optimize(self, batch):
         self.model.train()
@@ -338,9 +360,13 @@ class TrainStepper():
                 has_keypoints=batch['has_keypoints'].to(self.device),
             )
 
-        # Forward pass
+        # Forward pass (optionally with DINO test-time adaptation: adapt then predict on clean img)
         initial_time = time.time()
-        if self.context: cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
+        if self.dino_tta is not None:
+            out, _ = self.dino_tta.predict(img, keypoints)
+            if self.context: cont, sem_mask_pred, part_mask_pred = out
+            else: cont = out[0] if isinstance(out, (tuple, list)) else out
+        elif self.context: cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
         else: cont = self.model(img, keypoints)
         time_taken = time.time() - initial_time
 

@@ -22,10 +22,14 @@ TRAINING:
   DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'
   BEST_MODEL_PATH: './checkpoints/demo_train_best.pth'
   PAL_LOSS_WEIGHTS: 0.0
+  DINO_TTA: True
+  DINO_TTA_STEPS: 2          # inner SGD steps per test batch
+  DINO_TTA_LR: 1e-3          # inner-loop lr (small = episodic stability)
+  DINO_TTA_OUT_WEIGHT: 1.0   # contact-prob consistency (MSE)
+  DINO_TTA_FEAT_WEIGHT: 1.0  # pooled-feature cosine consistency
+  DINO_TTA_ONLINE: False     # False = reset weights each batch (episodic); True = CoTTA-style EMA teacher
+
 VALIDATION:
   SUMMARY_STEPS: 1000
   DATASETS: ['damon']
   MAIN_DATASET: 'damon'
-  TTT: True
-  TTT_STEPS: 5
-  TTT_LR: 0.01

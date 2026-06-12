@@ -17,7 +17,18 @@ def test(hparams):
 
     logger.info(f'Loading weights from {hparams.TRAINING.BEST_MODEL_PATH}')
     _, _ = solver.load(hparams.TRAINING.BEST_MODEL_PATH)
-    
+
+    # Optional DINO teacher-student test-time adaptation (utils/dino_tta.py). In-domain this is
+    # ~a no-op; the step-0 consistency printed by report() below tells you if there's any signal.
+    if getattr(hparams.TRAINING, 'DINO_TTA', False):
+        solver.enable_dino_tta(
+            steps=hparams.TRAINING.DINO_TTA_STEPS,
+            lr=hparams.TRAINING.DINO_TTA_LR,
+            out_weight=hparams.TRAINING.DINO_TTA_OUT_WEIGHT,
+            feat_weight=hparams.TRAINING.DINO_TTA_FEAT_WEIGHT,
+            online=hparams.TRAINING.DINO_TTA_ONLINE,
+            normalized=getattr(hparams.DATASET, 'NORMALIZE_IMAGES', True))
+
     # Run testing
     for test_loader in val_loaders:
         dataset_name = test_loader.dataset.dataset
@@ -32,6 +43,8 @@ def test(hparams):
             print('Test Contact Semantic Segmentation IoU: ', test_dict['sem_iou'])
             print('Test Contact Part Segmentation IoU: ', test_dict['part_iou'])
         print('\nTime taken per image for evaluation: ', total_time)
+        if solver.dino_tta is not None:
+            solver.dino_tta.report()       # mean step-0 consistency: ~0 => TTA is a no-op in-domain
         print('-'*50)
 
 if __name__ == '__main__':
