@@ -23,6 +23,10 @@ TRAINING:
   BEST_MODEL_PATH: './checkpoints/deco_best.pth'
   LOSS_WEIGHTS: 1.
   PAL_LOSS_WEIGHTS: 0.0   # 0.01
+  DISTILL: True
+  DISTILL_DINO_WEIGHT: 0.1    # feature-DINO prototype CE (the named DINO method); 0 = output-consistency only
+  DISTILL_OUT_WEIGHT: 1.0     # output-consistency MSE on contact probs (on-task, primary)
+  DISTILL_RAMP_STEPS: 4000    # warm distill terms 0->1 over ~first 2 epochs (tune to steps/epoch)
 VALIDATION:
   SUMMARY_STEPS: 5
   DATASETS: ['damon']

@@ -3,6 +3,7 @@ from utils.keypoint_prompts import build_keypoint_prompts
 import torch
 import os
 import time
+from utils.distill import build_teacher, ema_update, two_views, DINOHead, DINOLoss, FeatureGrabber
 
 
 class TrainStepper():
@@ -61,6 +62,37 @@ class TrainStepper():
         self.lr = learning_rate
         self.loss_weight = loss_weight
         self.pal_loss_weight = pal_loss_weight
+        self.distill = False
+
+    def enable_distill(self, out_dim=4096, dino_weight=0.0, out_weight=1.0, ema_momentum=0.996,
+                       teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000):
+        """DINO teacher-student self-distillation (no labels) on the contact path (utils/distill.py).
+
+        Builds an EMA teacher that SHARES the frozen SAM backbone, a student+teacher DINO head on
+        the pooled fused tokens (input to classif), and the DINO loss; adds the student head to
+        optimizer_contact so it trains. Per-step losses (ramped 0->1 over ramp_steps batches):
+        output-consistency MSE on contact probs (on-task, out_weight) + feature-DINO CE (the named
+        DINO method, dino_weight). The teacher targets the WEAK view; the student the MILD view."""
+        from common import constants
+        self.distill = True
+        self.ema_momentum = ema_momentum
+        self.dino_weight = dino_weight
+        self.out_weight = out_weight
+        self.distill_ramp_steps = ramp_steps
+        self._distill_step = 0
+        self.img_mean = torch.tensor(constants.IMG_NORM_MEAN, device=self.device).view(1, 3, 1, 1)
+        self.img_std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
+        mp = getattr(self.model.classif, 'mem_proj', None)
+        feat_dim = mp.in_features if isinstance(mp, torch.nn.Linear) else 1280
+        self.teacher = build_teacher(self.model, share_prefix='encoder_part')
+        self.student_dino_head = DINOHead(feat_dim, out_dim).to(self.device)
+        self.teacher_dino_head = build_teacher(self.student_dino_head, share_prefix=None)
+        self.dino_loss = DINOLoss(out_dim, teacher_temp, student_temp, center_momentum).to(self.device)
+        self.student_feat = FeatureGrabber(self.model.classif)
+        self.teacher_feat = FeatureGrabber(self.teacher.classif)
+        self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
+        print(f'✓ DINO distillation ON: out_dim={out_dim}, dino_w={dino_weight}, out_w={out_weight}, '
+              f'ema={ema_momentum}, ramp={ramp_steps}, feat_dim={feat_dim}')
 
     def optimize(self, batch):
         self.model.train()
@@ -98,11 +130,18 @@ class TrainStepper():
                 has_keypoints=batch['has_keypoints'].to(self.device),
             )
 
+        # DINO distillation: two photometric views (geometry preserved -> labels valid). The
+        # student trains on the MILD view (supervised + distilled); the EMA teacher sees the
+        # WEAK view and provides the label-free targets.
+        student_img, teacher_img = img, None
+        if getattr(self, 'distill', False):
+            teacher_img, student_img = two_views(img, self.img_mean, self.img_std)
+
         # Forward pass
         if self.context:
-            cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
+            cont, sem_mask_pred, part_mask_pred = self.model(student_img, keypoints)
         else:
-            cont = self.model(img)    
+            cont = self.model(student_img)
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
@@ -134,6 +173,23 @@ class TrainStepper():
         if self.context: loss = loss_sem + loss_part + self.loss_weight * loss_cont + self.pal_loss_weight * loss_pix_anchoring
         else: loss = self.loss_weight * loss_cont + self.pal_loss_weight * loss_pix_anchoring
 
+        # DINO teacher-student distillation (label-free), ramped up from 0 so the early lagging
+        # teacher doesn't drag the student. Teacher runs the WEAK view under no_grad.
+        loss_out = loss_dino = None
+        if getattr(self, 'distill', False):
+            ramp = min(1.0, self._distill_step / max(self.distill_ramp_steps, 1))
+            self._distill_step += 1
+            student_feat = self.student_feat.feat                  # pooled fused tokens (captured by hook)
+            with torch.no_grad():
+                t_out = self.teacher(teacher_img, keypoints)
+                teacher_cont = t_out[0] if isinstance(t_out, (tuple, list)) else t_out
+                teacher_logits = self.teacher_dino_head(self.teacher_feat.feat) if self.dino_weight > 0 else None
+            loss_out = ((cont - teacher_cont) ** 2).mean()         # on-task: output (contact-prob) consistency
+            loss = loss + ramp * self.out_weight * loss_out
+            if self.dino_weight > 0:                               # the named DINO method: feature self-distillation
+                loss_dino = self.dino_loss(self.student_dino_head(student_feat), teacher_logits)
+                loss = loss + ramp * self.dino_weight * loss_dino
+
         if self.context:
             self.optimizer_sem.zero_grad()
             self.optimizer_part.zero_grad()
@@ -150,6 +206,11 @@ class TrainStepper():
         # if self.optimizer_backbone is not None:
         #     self.optimizer_backbone.step()
 
+        # EMA-update the teacher (skip the shared frozen backbone) and the teacher DINO head.
+        if getattr(self, 'distill', False):
+            ema_update(self.teacher, self.model, self.ema_momentum, skip_prefix='encoder_part')
+            ema_update(self.teacher_dino_head, self.student_dino_head, self.ema_momentum, skip_prefix=None)
+
         if self.context:
             losses = {'sem_loss': loss_sem,
                     'part_loss': loss_part,
@@ -159,7 +220,12 @@ class TrainStepper():
         else:
             losses = {'cont_loss': loss_cont,
                     'pal_loss': loss_pix_anchoring,
-                    'total_loss': loss}         
+                    'total_loss': loss}
+
+        if loss_out is not None:                       # DINO distillation diagnostics (for logging)
+            losses['out_loss'] = loss_out
+            if loss_dino is not None:
+                losses['dino_loss'] = loss_dino
 
         if self.context:
             output = {
