@@ -28,3 +28,6 @@ models/cliff_res50/
 models/backbones/hrnet/
 vis/
 events.*
+1.log
+2.log
+deco_results/
