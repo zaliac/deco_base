@@ -58,8 +58,16 @@ class BaseDataset(Dataset):
             self.keypoint_conf = None
             self.has_keypoints = np.zeros(len(self.images))
 
-        self.sem_masks = self.data['scene_seg']
-        self.part_masks = self.data['part_seg']
+        # Scene/part segmentation masks (HOT-style). Optional: datasets like BEHAVE
+        # have no such masks, so we return zeros instead of crashing. Seg losses/IoU
+        # are then not meaningful, but contact metrics are unaffected.
+        self.sem_masks = self.data['scene_seg'] if 'scene_seg' in self.data else None
+        self.part_masks = self.data['part_seg'] if 'part_seg' in self.data else None
+
+        # Optional per-image person-crop bbox [x0,y0,x1,y1] in original-image pixels.
+        # Used by datasets whose images are not person-centric (e.g. BEHAVE full
+        # Kinect frames); absent for DAMON/RICH/PROX -> no cropping.
+        self.crop_bbox = self.data['crop_bbox'] if 'crop_bbox' in self.data else None
 
         # Get gt SMPL parameters, if available
         try:
@@ -70,7 +78,7 @@ class BaseDataset(Dataset):
                 self.has_smpl = self.data['has_smpl']
             else:
                 self.has_smpl = np.ones(len(self.images))
-                self.is_smplx = np.ones(len(self.images)) if model_type == 'smplx' else np.zeros(len(self.images))
+            self.is_smplx = np.ones(len(self.images)) if model_type == 'smplx' else np.zeros(len(self.images))
         except KeyError:
             self.has_smpl = np.zeros(len(self.images))
             self.is_smplx = np.zeros(len(self.images))
@@ -93,6 +101,10 @@ class BaseDataset(Dataset):
         img_path = os.path.join(self.dataset_base_path, img_path)
         try:
             img = cv2.imread(img_path)
+            if self.crop_bbox is not None:
+                x0, y0, x1, y1 = [int(v) for v in self.crop_bbox[index]]
+                if x1 > x0 and y1 > y0:
+                    img = img[y0:y1, x0:x1]
             img_h, img_w, _ = img.shape
             img = cv2.resize(img, (256, 256), cv2.INTER_CUBIC)
             img = img.transpose(2, 0, 1) / 255.0
@@ -117,23 +129,27 @@ class BaseDataset(Dataset):
         else:
             contact_label_3d = np.zeros(self.n_vertices)
 
-        sem_mask_path = self.sem_masks[index]
-        sem_mask_path = os.path.join(self.dataset_base_path, sem_mask_path)
-        try:
-            sem_mask = cv2.imread(sem_mask_path)
-            sem_mask = cv2.resize(sem_mask, (256, 256), cv2.INTER_CUBIC)
-            sem_mask = mask_split(sem_mask, 133)
-        except:
-            print('Scene seg: ', sem_mask_path)
+        sem_mask = np.zeros((133, 256, 256))
+        if self.sem_masks is not None:
+            sem_mask_path = os.path.join(self.dataset_base_path, self.sem_masks[index])
+            try:
+                sem_mask = cv2.imread(sem_mask_path)
+                sem_mask = cv2.resize(sem_mask, (256, 256), cv2.INTER_CUBIC)
+                sem_mask = mask_split(sem_mask, 133)
+            except:
+                print('Scene seg: ', sem_mask_path)
+                sem_mask = np.zeros((133, 256, 256))
 
-        try:
-            part_mask_path = self.part_masks[index]
-            part_mask_path = os.path.join(self.dataset_base_path, part_mask_path)
-            part_mask = cv2.imread(part_mask_path)
-            part_mask = cv2.resize(part_mask, (256, 256), cv2.INTER_CUBIC)
-            part_mask = mask_split(part_mask, 26)
-        except:
-            print('Part seg: ', part_mask_path)
+        part_mask = np.zeros((26, 256, 256))
+        if self.part_masks is not None:
+            part_mask_path = os.path.join(self.dataset_base_path, self.part_masks[index])
+            try:
+                part_mask = cv2.imread(part_mask_path)
+                part_mask = cv2.resize(part_mask, (256, 256), cv2.INTER_CUBIC)
+                part_mask = mask_split(part_mask, 26)
+            except:
+                print('Part seg: ', part_mask_path)
+                part_mask = np.zeros((26, 256, 256))
 
         try:
             if self.has_polygon_contact_2d[index]:

@@ -54,6 +54,19 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
 
     eval_dict = {}
 
+    # BEHAVE has no foot-ground contact annotation, so the protocol masks SMPL foot
+    # vertices in BOTH GT and prediction before computing contact metrics. Only for
+    # behave; other datasets keep foot contact.
+    foot_vids = None
+    if str(dataset_name).lower() == 'behave':
+        import json
+        _seg = json.load(open('data/smpl_vert_segmentation.json'))
+        _fv = []
+        for _k in ('leftFoot', 'rightFoot', 'leftToeBase', 'rightToeBase'):
+            _fv += _seg[_k]
+        foot_vids = torch.as_tensor(sorted(set(_fv)), dtype=torch.long)
+        print(f'[behave] masking {len(foot_vids)} foot vertices in GT and prediction')
+
     length = len(val_loader)
     iterator = tqdm(enumerate(val_loader), total=length, leave=False, desc=f'Evaluating {dataset_name.capitalize()} Epoch: {epoch}/{total_epochs}')
     for step, batch in iterator:
@@ -69,6 +82,10 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
         assert torch.any(has_contact_3d == 0) == False, 'has_contact_3d tensor has 0 values'
 
         contact_labels_3d_pred = output['contact_labels_3d_pred']
+        if foot_vids is not None:
+            fv = foot_vids.to(contact_labels_3d.device)
+            contact_labels_3d[:, fv] = 0
+            contact_labels_3d_pred[:, fv.to(contact_labels_3d_pred.device)] = 0
         if hparams.TRAINING.CONTEXT:
             sem_mask_gt = output['sem_mask_gt']
             sem_seg_pred = output['sem_mask_pred']
@@ -101,6 +118,11 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
     eval_dict['cont_precision'] = np.sum(val_epoch_cont_pre) / dataset_size
     eval_dict['cont_recall'] = np.sum(val_epoch_cont_rec) / dataset_size
     eval_dict['cont_f1'] = np.sum(val_epoch_cont_f1) / dataset_size
+    # Paper-style F1: harmonic mean of the dataset-mean precision and recall
+    # (DECO/contact papers report this). Differs from the per-image-averaged
+    # cont_f1 above, which is stricter (e.g. no-contact frames score F1=0).
+    _p, _r = eval_dict['cont_precision'], eval_dict['cont_recall']
+    eval_dict['cont_f1_paper'] = float(2 * _p * _r / (_p + _r)) if (_p + _r) > 0 else 0.0
     eval_dict['fp_geo_err'] = np.sum(val_epoch_fp_geo_err) / dataset_size
     eval_dict['fn_geo_err'] = np.sum(val_epoch_fn_geo_err) / dataset_size
     if hparams.TRAINING.CONTEXT:

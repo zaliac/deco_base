@@ -26,6 +26,7 @@ def test(hparams):
         print('Test Contact Precision: ', test_dict['cont_precision'])
         print('Test Contact Recall: ', test_dict['cont_recall'])
         print('Test Contact F1 Score: ', test_dict['cont_f1'])
+        print('Test Contact F1 Score (paper: harmonic of mean P/R): ', test_dict['cont_f1_paper'])
         print('Test Contact FP Geo. Error: ', test_dict['fp_geo_err'])
         print('Test Contact FN Geo. Error: ', test_dict['fn_geo_err'])
         if hparams.TRAINING.CONTEXT:
@@ -51,7 +52,7 @@ if __name__ == '__main__':
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
             val_datasets.append(BaseDataset(ds, 'val', model_type='smplx', normalize=hparams.DATASET.NORMALIZE_IMAGES))
-        elif ds in ['damon']:
+        elif ds in ['damon', 'behave']:
             val_datasets.append(BaseDataset(ds, 'val', model_type='smpl', normalize=hparams.DATASET.NORMALIZE_IMAGES))
         else:
             raise ValueError('Dataset not supported')

@@ -29,5 +29,5 @@ TRAINING:
   DISTILL_RAMP_STEPS: 4000    # warm distill terms 0->1 over ~first 2 epochs (tune to steps/epoch)
 VALIDATION:
   SUMMARY_STEPS: 5
-  DATASETS: ['rich']
-  MAIN_DATASET: 'rich'
+  DATASETS: ['damon']
+  MAIN_DATASET: 'damon'
