@@ -4,10 +4,11 @@ import torch.nn.functional as F
 import torch
 
 class DECO(nn.Module):
-    def __init__(self, encoder, context, device):
+    def __init__(self, encoder, context, device, sem_encoder='sam_objects'):
         super(DECO, self).__init__()
         self.encoder_type = encoder
         self.context = context
+        self.sem_encoder = sem_encoder
 
         # Generic shared encoders only exist for the plain CNN/transformer backbones.
         # 'sam_hrnet' builds its own encoders inside the branch below.
@@ -61,15 +62,32 @@ class DECO(nn.Module):
             # self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=1).to(device)
             # encoder_sem: HRNet -> (B, 480, 64, 64); strided conv projects 480 -> 1280
             # AND downsamples 64x64 -> 16x16 (learnable 4x4 pooling) to align with the SAM grid
-            from models.sam3d_encoder import SAM3DObjectsEncoder
-            sam_obj_ckpt = 'data/weights/sam-3d-objects/model.ckpt'
-            self.encoder_sem = SAM3DObjectsEncoder(
-                checkpoint_path=sam_obj_ckpt,
-                project_to_dim=feature_dim,
-                freeze_backbone=True,
-                device=device,
-            ).to(device)
-            self.hrnet_to_sam = None
+            # Choose semantic encoder according to sem_encoder flag
+            if self.sem_encoder == 'hrnet':
+                self.encoder_sem = Encoder(encoder='hrnet').to(device)
+                self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=4, stride=4).to(device)
+            elif self.sem_encoder in ('sam_objects', 'sam_3d_objects'):
+                from models.sam3d_encoder import SAM3DObjectsEncoder
+                sam_obj_ckpt = 'data/weights/sam-3d-objects/model.ckpt'
+                self.encoder_sem = SAM3DObjectsEncoder(
+                    checkpoint_path=sam_obj_ckpt,
+                    project_to_dim=feature_dim,
+                    freeze_backbone=True,
+                    device=device,
+                ).to(device)
+                self.hrnet_to_sam = None
+            elif self.sem_encoder == 'sam3d_body':
+                from models.sam3d_encoder import SAM3DBodyEncoder
+                sam_body_ckpt = 'data/weights/sam-3d-body-dinov3/model.ckpt'
+                self.encoder_sem = SAM3DBodyEncoder(
+                    checkpoint_path=sam_body_ckpt,
+                    project_to_dim=feature_dim,
+                    freeze_backbone=True,
+                    device=device,
+                ).to(device)
+                self.hrnet_to_sam = None
+            else:
+                raise ValueError(f'Unknown sem_encoder: {self.sem_encoder}')
 
             if self.context:
                 # decoder_sem decodes the (B,1280,16,16) projected HRNet map -> x16 -> (B,133,256,256)
@@ -123,9 +141,12 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: SAM-3D-Objects backbone -> (B, 1280, 16, 16)
-            sem_enc_out = self.encoder_sem(img)                 # (B, 1280, 16, 16)
-            sem_enc_out_new = sem_enc_out
+            # semantic branch: encoder_sem -> expected (B, feature_dim, Hp, Wp)
+            sem_enc_out = self.encoder_sem(img)
+            if hasattr(self, 'hrnet_to_sam') and self.hrnet_to_sam is not None:
+                sem_enc_out_new = self.hrnet_to_sam(sem_enc_out)
+            else:
+                sem_enc_out_new = sem_enc_out
 
             if self.context:
                 sem_mask_pred = self.decoder_sem(sem_enc_out_new)  # (B,1280,16,16) -> (B,133,256,256)

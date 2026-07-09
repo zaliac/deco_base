@@ -287,6 +287,7 @@ class SAM3DObjectsEncoder(nn.Module):
             project_to_dim=None,
             freeze_backbone=False,
             device='cuda',
+            loader_name=None,
     ):
         super(SAM3DObjectsEncoder, self).__init__()
 
@@ -298,13 +299,43 @@ class SAM3DObjectsEncoder(nn.Module):
             raise ValueError("checkpoint_path is required")
 
         try:
-            # sam-3d-objects is expected to provide a load helper similar to sam-3d-body
-            from sam_3d_objects import load_sam_3d_objects
+            import sam_3d_objects as s3o
         except ImportError:
             raise ImportError("SAM-3D-Objects can not be loaded !!!")
 
-        print(f"Loading SAM-3D-Objects from {checkpoint_path}")
-        model, self.model_cfg = load_sam_3d_objects(checkpoint_path=checkpoint_path, device=device)
+        # find a loader function inside the sam_3d_objects package; support multiple
+        # API variants by trying common names and an optional explicit loader_name.
+        loader = None
+        tried = []
+        candidates = [loader_name, 'load_sam_3d_objects', 'load_model', 'build_sam_3d_objects', 'load_from_checkpoint']
+        for name in candidates:
+            if not name:
+                continue
+            tried.append(name)
+            if hasattr(s3o, name):
+                loader = getattr(s3o, name)
+                break
+        if loader is None and hasattr(s3o, 'load'):
+            loader = getattr(s3o, 'load')
+            tried.append('load')
+
+        if loader is None:
+            raise ImportError(f"Could not find a loader in sam_3d_objects; tried: {tried}")
+
+        print(f"Loading SAM-3D-Objects from {checkpoint_path} using loader {getattr(loader, '__name__', str(loader))}")
+        # try keyword args first, then fall back to positional
+        try:
+            model_tuple = loader(checkpoint_path=checkpoint_path, device=device)
+        except TypeError:
+            model_tuple = loader(checkpoint_path, device)
+
+        # many loaders return (model, cfg)
+        if isinstance(model_tuple, tuple) and len(model_tuple) >= 1:
+            model = model_tuple[0]
+            self.model_cfg = model_tuple[1] if len(model_tuple) > 1 else None
+        else:
+            model = model_tuple
+            self.model_cfg = None
 
         # try to find backbone attribute
         self.backbone = getattr(model, 'backbone', getattr(model, 'encoder', None))
