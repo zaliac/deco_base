@@ -61,8 +61,15 @@ class DECO(nn.Module):
             # self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=1).to(device)
             # encoder_sem: HRNet -> (B, 480, 64, 64); strided conv projects 480 -> 1280
             # AND downsamples 64x64 -> 16x16 (learnable 4x4 pooling) to align with the SAM grid
-            self.encoder_sem = Encoder(encoder='hrnet').to(device)
-            self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=4, stride=4).to(device)
+            from models.sam3d_encoder import SAM3DObjectsEncoder
+            sam_obj_ckpt = 'data/weights/sam-3d-objects/model.ckpt'
+            self.encoder_sem = SAM3DObjectsEncoder(
+                checkpoint_path=sam_obj_ckpt,
+                project_to_dim=feature_dim,
+                freeze_backbone=True,
+                device=device,
+            ).to(device)
+            self.hrnet_to_sam = None
 
             if self.context:
                 # decoder_sem decodes the (B,1280,16,16) projected HRNet map -> x16 -> (B,133,256,256)
@@ -116,9 +123,9 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: HRNet -> (B, 480, 64, 64) -> project + downsample to (B, 1280, 16, 16)
-            sem_enc_out = self.encoder_sem(img)                 # (B, 480, 64, 64)
-            sem_enc_out_new = self.hrnet_to_sam(sem_enc_out)    # (B, 1280, 16, 16) learnable downsample
+            # semantic branch: SAM-3D-Objects backbone -> (B, 1280, 16, 16)
+            sem_enc_out = self.encoder_sem(img)                 # (B, 1280, 16, 16)
+            sem_enc_out_new = sem_enc_out
 
             if self.context:
                 sem_mask_pred = self.decoder_sem(sem_enc_out_new)  # (B,1280,16,16) -> (B,133,256,256)
