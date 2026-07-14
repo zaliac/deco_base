@@ -272,3 +272,73 @@ class SAM3DBodyEncoder(nn.Module):
             feat = self.projection(feat)
 
         return feat
+
+
+class SAM3DObjectsEncoder(nn.Module):
+    """Wrapper for the SAM-3D-Objects backbone to provide DECO-compatible features.
+
+    Attempts to reuse the sam_3d_objects load function. The wrapper exposes the same
+    simple interface as SAM3DBodyEncoder: forward(x) -> (B, C, H_patch, W_patch).
+    """
+
+    def __init__(
+            self,
+            checkpoint_path=None,
+            project_to_dim=None,
+            freeze_backbone=False,
+            device='cuda',
+    ):
+        super(SAM3DObjectsEncoder, self).__init__()
+
+        self.project_to_dim = project_to_dim
+        self.device = device
+        self.freeze_backbone = freeze_backbone
+
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path is required")
+
+        try:
+            # sam-3d-objects is expected to provide a load helper similar to sam-3d-body
+            from sam_3d_objects import load_sam_3d_objects
+        except ImportError:
+            raise ImportError("SAM-3D-Objects can not be loaded !!!")
+
+        print(f"Loading SAM-3D-Objects from {checkpoint_path}")
+        model, self.model_cfg = load_sam_3d_objects(checkpoint_path=checkpoint_path, device=device)
+
+        # try to find backbone attribute
+        self.backbone = getattr(model, 'backbone', getattr(model, 'encoder', None))
+        if self.backbone is None:
+            raise RuntimeError('Loaded sam_3d_objects model has no backbone/encoder')
+
+        self.embed_dim = getattr(self.backbone, 'embed_dim', None) or getattr(self.backbone, 'embed_dims', None)
+        self.patch_size = getattr(self.backbone, 'patch_size', 16)
+        self.backbone_dtype = getattr(model, 'backbone_dtype', torch.float32)
+        del model
+
+        if project_to_dim is not None and project_to_dim != self.embed_dim:
+            self.projection = nn.Conv2d(self.embed_dim, project_to_dim, kernel_size=1)
+        else:
+            self.projection = None
+
+        if self.freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            print("✓ SAM-3D-Objects backbone frozen")
+
+    def forward(self, x):
+        backbone_ctx = (
+            torch.no_grad() if self.freeze_backbone else contextlib.nullcontext()
+        )
+        with backbone_ctx:
+            feat = self.backbone(x.to(self.backbone_dtype))
+
+        if isinstance(feat, (tuple, list)):
+            feat = feat[-1]
+        feat = feat.float()
+
+        if self.projection is not None:
+            feat = self.projection(feat)
+
+        return feat
+
