@@ -1,6 +1,7 @@
 # /home/l_z80934/projects/deco/models/sam3d_encoder.py
 
 import contextlib
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -275,46 +276,69 @@ class SAM3DBodyEncoder(nn.Module):
 
 
 class SAM3DObjectsEncoder(nn.Module):
-    """Wrapper for the SAM-3D-Objects backbone to provide DECO-compatible features.
+    """RGB backbone from SAM-3D-Objects, adapted to DECO feature maps.
 
-    Attempts to reuse the sam_3d_objects load function. The wrapper exposes the same
-    simple interface as SAM3DBodyEncoder: forward(x) -> (B, C, H_patch, W_patch).
+    SAM-3D-Objects' ``ss_encoder.ckpt`` is a voxel VAE encoder and cannot consume an
+    RGB image.  Its image backbone instead lives in the RGB DINO conditioner declared
+    in ``ss_generator.yaml`` and stored under
+    ``_base_models.condition_embedder.module_list.0.backbone`` in
+    ``ss_generator.ckpt``.  This wrapper loads only that frozen visual backbone, then
+    projects its patch features to DECO's channel width and pools them to the body
+    branch's spatial grid.
+
+    ``forward`` returns ``(B, project_to_dim, H_out, W_out)``.  For the default
+    256x256 DECO crop this is ``(B, 1280, 16, 16)``, matching
+    :class:`SAM3DBodyEncoderWithPrompts`.
     """
 
     def __init__(
             self,
             checkpoint_path=None,
+            config_path=None,
             project_to_dim=None,
+            output_size=(16, 16),
+            image_embedder_index=0,
             freeze_backbone=False,
+            input_is_normalized=True,
             device='cuda',
     ):
         super(SAM3DObjectsEncoder, self).__init__()
 
         self.project_to_dim = project_to_dim
-        self.device = device
         self.freeze_backbone = freeze_backbone
+        self.output_size = output_size
+        self.input_is_normalized = input_is_normalized
+        self.image_embedder_index = image_embedder_index
 
         if checkpoint_path is None:
             raise ValueError("checkpoint_path is required")
 
-        try:
-            # sam-3d-objects is expected to provide a load helper similar to sam-3d-body
-            from sam_3d_objects import load_sam_3d_objects
-        except ImportError:
-            raise ImportError("SAM-3D-Objects can not be loaded !!!")
+        checkpoint_path = Path(checkpoint_path)
+        if config_path is None:
+            config_path = checkpoint_path.with_name('ss_generator.yaml')
+        config_path = Path(config_path)
 
-        print(f"Loading SAM-3D-Objects from {checkpoint_path}")
-        model, self.model_cfg = load_sam_3d_objects(checkpoint_path=checkpoint_path, device=device)
+        self.model_cfg, image_cfg = self._load_image_backbone_config(
+            config_path, image_embedder_index
+        )
+        self.dino_model = image_cfg.get('dino_model', 'dinov2_vitl14_reg')
+        self.input_size = image_cfg.get('input_size', 518)
+        self.normalize_images = bool(image_cfg.get('normalize_images', True))
+        self.repo_or_dir = image_cfg.get('repo_or_dir', 'facebookresearch/dinov2')
+        self.source = image_cfg.get('source', 'github')
 
-        # try to find backbone attribute
-        self.backbone = getattr(model, 'backbone', getattr(model, 'encoder', None))
-        if self.backbone is None:
-            raise RuntimeError('Loaded sam_3d_objects model has no backbone/encoder')
+        print(
+            f"Loading SAM-3D-Objects RGB DINO ({self.dino_model}) from "
+            f"{checkpoint_path}"
+        )
+        self.backbone = self._build_backbone()
+        self._load_backbone_weights(checkpoint_path, image_embedder_index)
 
-        self.embed_dim = getattr(self.backbone, 'embed_dim', None) or getattr(self.backbone, 'embed_dims', None)
-        self.patch_size = getattr(self.backbone, 'patch_size', 16)
-        self.backbone_dtype = getattr(model, 'backbone_dtype', torch.float32)
-        del model
+        self.embed_dim = getattr(self.backbone, 'embed_dim', None)
+        if self.embed_dim is None:
+            raise RuntimeError('SAM-3D-Objects DINO backbone has no embed_dim')
+        patch_embed = getattr(self.backbone, 'patch_embed', None)
+        self.patch_size = getattr(patch_embed, 'patch_size', 14)
 
         if project_to_dim is not None and project_to_dim != self.embed_dim:
             self.projection = nn.Conv2d(self.embed_dim, project_to_dim, kernel_size=1)
@@ -322,23 +346,184 @@ class SAM3DObjectsEncoder(nn.Module):
             self.projection = None
 
         if self.freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+            # The two frozen ViTs must fit alongside DECO's contact head on an 8GB
+            # RTX 3060 Ti.  Run the SAM-3D-Objects DINO in fp16 on CUDA, but keep
+            # projection/fusion layers in fp32 for stable training.
+            if str(device).startswith('cuda'):
+                self.backbone.half()
             print("✓ SAM-3D-Objects backbone frozen")
 
-    def forward(self, x):
+        self.backbone_dtype = next(self.backbone.parameters()).dtype
+        self.register_buffer(
+            'image_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            'image_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _load_image_backbone_config(config_path, image_embedder_index):
+        """Read the RGB-DINO entry from the local SAM-3D-Objects generator config."""
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(
+                'PyYAML is required to read the SAM-3D-Objects generator config'
+            ) from exc
+
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f'SAM-3D-Objects generator config not found: {config_path}'
+            )
+        with config_path.open('r') as handle:
+            config = yaml.safe_load(handle)
+
+        try:
+            embedder_list = config['module']['condition_embedder']['backbone']['embedder_list']
+            image_cfg = embedder_list[image_embedder_index][0]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                'Could not find the RGB DINO conditioner in '
+                f'{config_path} at index {image_embedder_index}'
+            ) from exc
+
+        target = str(image_cfg.get('_target_', '')) if isinstance(image_cfg, dict) else ''
+        if not target.endswith('.Dino'):
+            raise RuntimeError(
+                'The selected SAM-3D-Objects conditioner is not a DINO image '
+                f'backbone: {target or image_cfg!r}'
+            )
+        return config, image_cfg
+
+    def _build_backbone(self):
+        """Instantiate the DINO module without downloading generic pretrained weights.
+
+        SAM-3D-Objects supplies its own DINO weights in ``ss_generator.ckpt``.  Using
+        ``pretrained=False`` avoids an unnecessary network download and lets this work
+        from the checked-out DINOv2 hub cache used by this project.
+        """
+        hub_dir = Path(torch.hub.get_dir())
+        local_repos = sorted(hub_dir.glob('facebookresearch_dinov2_*'))
+        if local_repos:
+            return torch.hub.load(
+                str(local_repos[0]), self.dino_model, source='local', pretrained=False
+            )
+        return torch.hub.load(
+            self.repo_or_dir, self.dino_model, source=self.source, pretrained=False
+        )
+
+    def _load_backbone_weights(self, checkpoint_path, image_embedder_index):
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f'SAM-3D-Objects generator checkpoint not found: {checkpoint_path}'
+            )
+
+        # mmap prevents the 6.3GB generator checkpoint from being fully materialized
+        # in CPU RAM while we copy only the selected DINO weights into this module.
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location='cpu', mmap=True, weights_only=True
+            )
+        except TypeError:  # PyTorch versions before mmap/weights_only support
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        if not isinstance(state_dict, dict):
+            raise RuntimeError(
+                f'Unsupported SAM-3D-Objects checkpoint format: {checkpoint_path}'
+            )
+
+        prefix = (
+            '_base_models.condition_embedder.module_list.'
+            f'{image_embedder_index}.backbone.'
+        )
+        backbone_state = {
+            name[len(prefix):]: value
+            for name, value in state_dict.items()
+            if name.startswith(prefix)
+        }
+        if not backbone_state:
+            raise RuntimeError(
+                'The checkpoint has no SAM-3D-Objects RGB DINO weights under '
+                f'{prefix!r}. Use ss_generator.ckpt, not ss_encoder.ckpt.'
+            )
+
+        incompatible = self.backbone.load_state_dict(backbone_state, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                'SAM-3D-Objects RGB DINO checkpoint does not match '
+                f'{self.dino_model}; missing={incompatible.missing_keys}, '
+                f'unexpected={incompatible.unexpected_keys}'
+            )
+
+        del backbone_state
+        del state_dict
+        del checkpoint
+
+    def train(self, mode=True):
+        """Keep a frozen DINO backbone deterministic when DECO enters train mode."""
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x, output_size=None):
+        """Return projected SAM-3D-Objects RGB patch features.
+
+        ``x`` is DECO's ImageNet-normalized image tensor.  SAM-3D-Objects expects
+        raw RGB before applying the same ImageNet normalization, so the tensor is
+        denormalized, resized to its native 518px DINO resolution, and normalized once.
+        ``output_size`` can be supplied by DECO to exactly match the body feature grid.
+        """
+        if x.ndim != 4 or x.shape[1] != 3:
+            raise ValueError(f'Expected RGB input (B, 3, H, W), got {tuple(x.shape)}')
+
+        image = x.float()
+        mean = self.image_mean.to(dtype=image.dtype, device=image.device)
+        std = self.image_std.to(dtype=image.dtype, device=image.device)
+        if self.input_is_normalized:
+            image = image * std + mean
+        image = F.interpolate(
+            image, size=(self.input_size, self.input_size), mode='bilinear', align_corners=False
+        )
+        if self.normalize_images:
+            image = (image - mean) / std
+
         backbone_ctx = (
             torch.no_grad() if self.freeze_backbone else contextlib.nullcontext()
         )
         with backbone_ctx:
-            feat = self.backbone(x.to(self.backbone_dtype))
+            features = self.backbone.forward_features(image.to(self.backbone_dtype))
 
-        if isinstance(feat, (tuple, list)):
-            feat = feat[-1]
-        feat = feat.float()
+        if not isinstance(features, dict) or 'x_norm_patchtokens' not in features:
+            raise RuntimeError(
+                'SAM-3D-Objects DINO backbone must return x_norm_patchtokens from '
+                'forward_features()'
+            )
+        tokens = features['x_norm_patchtokens']
+        patch_size = self.patch_size[0] if isinstance(self.patch_size, (tuple, list)) else self.patch_size
+        grid_h = image.shape[-2] // patch_size
+        grid_w = image.shape[-1] // patch_size
+        if tokens.shape[1] != grid_h * grid_w:
+            raise RuntimeError(
+                'SAM-3D-Objects patch-token count does not match its input grid: '
+                f'{tokens.shape[1]} tokens for {grid_h}x{grid_w}'
+            )
+        feat = tokens.transpose(1, 2).reshape(
+            tokens.shape[0], tokens.shape[2], grid_h, grid_w
+        ).float()
 
         if self.projection is not None:
             feat = self.projection(feat)
 
-        return feat
+        target_size = self.output_size if output_size is None else output_size
+        if target_size is not None:
+            if isinstance(target_size, int):
+                target_size = (target_size, target_size)
+            feat = F.adaptive_avg_pool2d(feat, target_size)
 
+        return feat

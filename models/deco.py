@@ -86,7 +86,10 @@ class DECO(nn.Module):
                 dim=256, num_heads=8, num_layers=3,
             ).to(device)
         elif self.encoder_type == 'sam_sam':
-            from models.sam3d_encoder import SAM3DBodyEncoderWithPrompts
+            from models.sam3d_encoder import (
+                SAM3DBodyEncoderWithPrompts,
+                SAM3DObjectsEncoder,
+            )
 
             # SAM-3D-Body (DINOv3 ViT-H) checkpoint + model_config.yaml + MHR assets.
             sam_ckpt_path = 'data/weights/sam-3d-body-dinov3/model.ckpt'
@@ -105,36 +108,32 @@ class DECO(nn.Module):
                 device=device,
             ).to(device)
 
-            self.encoder_sem = Encoder(encoder='hrnet').to(device)
-            # self.hrnet_to_sam = nn.Conv2d(480, feature_dim, kernel_size=4, stride=4).to(device)
-
-            from models.sam3d_encoder import SAM3DObjectsEncoder
-            sam_obj_ckpt = 'data/weights/sam-3d-objects/ss_encoder.ckpt'
+            # SAM-3D-Objects' RGB backbone is the DINO conditioner inside the sparse
+            # structure *generator*.  ss_encoder.ckpt is a 3D voxel VAE, so it cannot
+            # encode DECO's RGB crop.  The wrapper extracts only the trained RGB DINO
+            # conditioner, projects 1024 -> 1280, and pools it to the body 16x16 grid.
+            sam_obj_cfg = 'data/weights/sam-3d-objects/ss_generator.yaml'
+            sam_obj_ckpt = 'data/weights/sam-3d-objects/ss_generator.ckpt'
             self.encoder_sem = SAM3DObjectsEncoder(
                 checkpoint_path=sam_obj_ckpt,
+                config_path=sam_obj_cfg,
                 project_to_dim=feature_dim,
+                output_size=(16, 16),
                 freeze_backbone=True,
+                input_is_normalized=True,
                 device=device,
             ).to(device)
-            self.hrnet_to_sam = None
 
             if self.context:
-                # decoder_sem decodes the (B,1280,16,16) projected HRNet map -> x16 -> (B,133,256,256)
+                # Both SAM branches provide (B,1280,16,16), so both auxiliary
+                # segmentation decoders use the same ViT-style x16 upsampling path.
                 self.decoder_sem = Decoder(feature_dim, 133, encoder='sam_vit').to(device)
-                # self.decoder_sem = Decoder(480, 133, encoder='hrnet').to(device)
-                # decoder_part decodes the (B,1280,16,16) SAM map   -> x16 -> (B,26,256,256)
                 self.decoder_part = Decoder(feature_dim, 26, encoder='sam_vit').to(device)
 
-            # Spatial cross-attention over the per-location tokens of each branch (not a
-            # single global-pooled token), so the SAM and HRNet features interact per
-            # location before aggregation, preserving spatial detail. Both branches are on
-            # the same 16x16 grid (sem downsampled by hrnet_to_sam), so grid_size=16 turns on
-            # per-stream input norm + a shared 2D positional embedding inside the fusion.
+            # The two SAM feature maps are co-registered on a 16x16 grid before spatial
+            # cross-attention.  This keeps the existing per-location fusion and vertex
+            # contact decoder unchanged from the sam_hrnet path.
             self.cross_att = Spatial_Cross_Att(feature_dim, num_heads=8, grid_size=16).to(device)
-            # Per-vertex contact head: 6890 learnable vertex queries cross-attend to the
-            # fused image tokens (replaces the global-vector MLP). Kept as `self.classif`
-            # so TrainStepper's optimizer_contact (model.classif.parameters()) still
-            # trains it without changes to train/trainer_step.py.
             self.classif = VertexContactDecoder(
                 context_dim=feature_dim, num_vertices=6890,
                 dim=256, num_heads=8, num_layers=3,
@@ -206,26 +205,24 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: HRNet -> (B, 480, 64, 64) -> project + downsample to (B, 1280, 16, 16)
-            sem_enc_out = self.encoder_sem(img)                 # (B, 480, 64, 64)
-            # sem_enc_out_new = self.hrnet_to_sam(sem_enc_out)    # (B, 1280, 16, 16) learnable downsample
-            sem_enc_out_new = sem_enc_out
+            # semantic branch: SAM-3D-Objects RGB DINO -> (B, 1280, Hp, Wp).  Passing
+            # the body grid makes the shape contract explicit instead of relying on a
+            # fixed 16x16 assumption inside the semantic encoder.
+            sem_enc_out_new = self.encoder_sem(
+                img, output_size=part_enc_out.shape[-2:]
+            )
 
             if self.context:
                 sem_mask_pred = self.decoder_sem(sem_enc_out_new)  # (B,1280,16,16) -> (B,133,256,256)
-                # sem_mask_pred = self.decoder_sem(sem_enc_out)       # (B, 480, 64, 64) -> (B,133,256,256)
                 part_mask_pred = self.decoder_part(part_enc_out)   # (B, 26, 256, 256)
 
-            # Tokenize both branches at their native 16x16. part (SAM) is the primary signal
-            # (256 tokens). sem (HRNet) was projected AND downsampled 64x64 -> 16x16 by the
-            # learnable strided conv self.hrnet_to_sam, so the 4x4 -> 1 spatial reduction is a
-            # learned weighted combination (not a blunt avg-pool) and the two branches align
-            # 1:1. The conv hard-codes the 64 -> 16 ratio, so assert the grids match in case
-            # the SAM/HRNet resolutions ever change. (Cross-attention does not require equal
-            # lengths, so sem could instead be kept at higher res -- at more memory tokens.)
-            Hp, Wp = part_enc_out.shape[-2:]
-            assert sem_enc_out_new.shape[-2:] == (Hp, Wp), \
-                f"sem grid {tuple(sem_enc_out_new.shape[-2:])} != part grid {(Hp, Wp)}; adjust hrnet_to_sam stride"
+            # Both branches now have the same (B,1280,Hp,Wp) shape before tokenization.
+            if sem_enc_out_new.shape != part_enc_out.shape:
+                raise RuntimeError(
+                    'SAM-3D-Objects feature shape '
+                    f'{tuple(sem_enc_out_new.shape)} != SAM-3D-Body feature shape '
+                    f'{tuple(part_enc_out.shape)}'
+                )
             sem_tok = sem_enc_out_new.flatten(2).transpose(1, 2)   # (B, 256, 1280)
             part_tok = part_enc_out.flatten(2).transpose(1, 2)     # (B, 256, 1280)
 

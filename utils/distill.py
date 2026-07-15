@@ -14,7 +14,7 @@ label-free distillation losses act on the contact path
 
 Lessons baked in (memory: deco-dino-distillation): the student view is kept MILD (no grayscale) so
 the supervised loss isn't trained on distorted images; the teacher SHARES the student's frozen SAM
-backbone (the 840M ViT is never duplicated / deep-copied); and the trainer ramps the weights 0->1.
+backbones (neither ViT is duplicated / deep-copied); and the trainer ramps the weights 0->1.
 """
 import copy
 
@@ -69,23 +69,55 @@ class DINOLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# EMA teacher (shares the frozen backbone -> never duplicates / deep-copies the ViT)
+# EMA teacher (shares frozen backbones -> never duplicates / deep-copies a ViT)
 # ---------------------------------------------------------------------------
+def _prefixes(prefix_or_prefixes):
+    if prefix_or_prefixes is None:
+        return ()
+    if isinstance(prefix_or_prefixes, str):
+        return (prefix_or_prefixes,)
+    return tuple(prefix for prefix in prefix_or_prefixes if prefix)
+
+
+def _module_parent(module, path):
+    """Return the parent module and attribute name for a dotted module path."""
+    parts = path.split('.')
+    parent = module
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent, parts[-1]
+
+
 def build_teacher(student, share_prefix='encoder_part'):
-    """Deep-copy `student` into an EMA teacher, but SHARE (not copy) the frozen backbone module
-    `student.<share_prefix>` -- temporarily swapped out before the deepcopy so the 840M ViT is
-    neither duplicated in memory nor deep-copied (deepcopy can fail on parametrized submodules).
-    eval() + no-grad."""
-    shared = getattr(student, share_prefix, None) if share_prefix else None
-    if shared is not None:
-        setattr(student, share_prefix, nn.Identity())
+    """Build an EMA teacher while sharing one or more frozen submodules.
+
+    ``share_prefix`` accepts a dotted path or an iterable of paths.  Each path is
+    temporarily replaced before ``deepcopy`` and restored afterwards, so large frozen
+    backbones are not duplicated.  Nested paths let a wrapper share only its frozen
+    backbone while retaining a separate, EMA-updated trainable adapter in the teacher.
+    """
+    shared_modules = []
+    for path in _prefixes(share_prefix):
+        try:
+            parent, name = _module_parent(student, path)
+            shared = getattr(parent, name, None)
+        except AttributeError:
+            shared = None
+        if shared is None:
+            continue
+        setattr(parent, name, nn.Identity())
+        shared_modules.append((path, shared))
+
     try:
         teacher = copy.deepcopy(student)
     finally:
-        if shared is not None:
-            setattr(student, share_prefix, shared)
-    if shared is not None:
-        setattr(teacher, share_prefix, shared)
+        for path, shared in shared_modules:
+            parent, name = _module_parent(student, path)
+            setattr(parent, name, shared)
+
+    for path, shared in shared_modules:
+        parent, name = _module_parent(teacher, path)
+        setattr(parent, name, shared)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -94,18 +126,22 @@ def build_teacher(student, share_prefix='encoder_part'):
 
 @torch.no_grad()
 def ema_update(teacher, student, momentum, skip_prefix='encoder_part'):
-    """teacher = momentum*teacher + (1-momentum)*student for params NOT under `skip_prefix`
-    (the shared frozen backbone). Buffers (e.g. BN stats) are copied from the student."""
+    """EMA-update everything except one or more shared frozen module paths."""
+    skip_prefixes = _prefixes(skip_prefix)
+
+    def is_shared(name):
+        return any(name == prefix or name.startswith(prefix + '.') for prefix in skip_prefixes)
+
     sp = dict(student.named_parameters())
     for name, tp in teacher.named_parameters():
-        if skip_prefix and name.startswith(skip_prefix):
+        if is_shared(name):
             continue
         s = sp.get(name)
         if s is not None:
             tp.mul_(momentum).add_(s.detach(), alpha=1 - momentum)
     sb = dict(student.named_buffers())
     for name, tb in teacher.named_buffers():
-        if skip_prefix and name.startswith(skip_prefix):
+        if is_shared(name):
             continue
         b = sb.get(name)
         if b is not None and b.shape == tb.shape:

@@ -22,7 +22,8 @@ class TrainStepper():
         # hrnet_to_sam (HRNet->SAM adapter) is a top-level submodule, NOT under encoder_sem,
         # so it must be listed explicitly or it never trains. Only feeds the contact path
         # (sem_tok -> cross_att -> classif), so it belongs here. Guarded for non-sam_hrnet models.
-        hrnet_to_sam_params = list(self.model.hrnet_to_sam.parameters()) if hasattr(self.model, 'hrnet_to_sam') else []
+        hrnet_to_sam = getattr(self.model, 'hrnet_to_sam', None)
+        hrnet_to_sam_params = list(hrnet_to_sam.parameters()) if hrnet_to_sam is not None else []
         self.optimizer_contact = torch.optim.Adam(
             params=list(self.model.encoder_sem.parameters()) + list(self.model.encoder_part.parameters()) + list(
                 self.model.cross_att.parameters()) + list(self.model.classif.parameters()) + hrnet_to_sam_params,
@@ -68,7 +69,7 @@ class TrainStepper():
                        teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000):
         """DINO teacher-student self-distillation (no labels) on the contact path (utils/distill.py).
 
-        Builds an EMA teacher that SHARES the frozen SAM backbone, a student+teacher DINO head on
+        Builds an EMA teacher that SHARES frozen SAM backbones, a student+teacher DINO head on
         the pooled fused tokens (input to classif), and the DINO loss; adds the student head to
         optimizer_contact so it trains. Per-step losses (ramped 0->1 over ramp_steps batches):
         output-consistency MSE on contact probs (on-task, out_weight) + feature-DINO CE (the named
@@ -84,7 +85,15 @@ class TrainStepper():
         self.img_std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
         mp = getattr(self.model.classif, 'mem_proj', None)
         feat_dim = mp.in_features if isinstance(mp, torch.nn.Linear) else 1280
-        self.teacher = build_teacher(self.model, share_prefix='encoder_part')
+        # The SAM-3D-Objects semantic wrapper has a frozen DINO backbone but a
+        # trainable 1024->1280 adapter.  Share only its frozen backbone with the
+        # teacher; the adapter remains a separate EMA copy.  This avoids duplicating
+        # the large ViT on a 3060 Ti while preserving teacher/student EMA behavior.
+        self.teacher_shared_prefixes = ('encoder_part',)
+        sem_encoder = getattr(self.model, 'encoder_sem', None)
+        if getattr(sem_encoder, 'freeze_backbone', False) and hasattr(sem_encoder, 'backbone'):
+            self.teacher_shared_prefixes += ('encoder_sem.backbone',)
+        self.teacher = build_teacher(self.model, share_prefix=self.teacher_shared_prefixes)
         self.student_dino_head = DINOHead(feat_dim, out_dim).to(self.device)
         self.teacher_dino_head = build_teacher(self.student_dino_head, share_prefix=None)
         self.dino_loss = DINOLoss(out_dim, teacher_temp, student_temp, center_momentum).to(self.device)
@@ -208,7 +217,10 @@ class TrainStepper():
 
         # EMA-update the teacher (skip the shared frozen backbone) and the teacher DINO head.
         if getattr(self, 'distill', False):
-            ema_update(self.teacher, self.model, self.ema_momentum, skip_prefix='encoder_part')
+            ema_update(
+                self.teacher, self.model, self.ema_momentum,
+                skip_prefix=self.teacher_shared_prefixes,
+            )
             ema_update(self.teacher_dino_head, self.student_dino_head, self.ema_momentum, skip_prefix=None)
 
         if self.context:
