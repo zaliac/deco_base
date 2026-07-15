@@ -49,14 +49,33 @@ if __name__ == '__main__':
         device = torch.device('cpu')
 
     val_datasets = []
+    use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
+    dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smplx', normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(
+                ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path,
+                normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                generate_object_masks=use_sam_object_masks,
+            ))
         elif ds in ['damon', 'behave']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smpl', normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(
+                ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path,
+                normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                generate_object_masks=use_sam_object_masks,
+            ))
         else:
             raise ValueError('Dataset not supported')
 
-    val_loaders = [DataLoader(val_dataset, batch_size=hparams.DATASET.BATCH_SIZE, shuffle=False, num_workers=hparams.DATASET.NUM_WORKERS) for val_dataset in val_datasets]
+    # Dynamic SAM inference uses CUDA and therefore cannot safely occur in the
+    # default forked DataLoader workers after the model has been initialized.
+    data_workers = 0 if use_sam_object_masks else hparams.DATASET.NUM_WORKERS
+    val_loaders = [
+        DataLoader(
+            val_dataset, batch_size=hparams.DATASET.BATCH_SIZE, shuffle=False,
+            num_workers=data_workers,
+        )
+        for val_dataset in val_datasets
+    ]
 
     test(hparams)

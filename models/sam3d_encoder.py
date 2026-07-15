@@ -276,15 +276,13 @@ class SAM3DBodyEncoder(nn.Module):
 
 
 class SAM3DObjectsEncoder(nn.Module):
-    """RGB backbone from SAM-3D-Objects, adapted to DECO feature maps.
+    """Image-and-mask backbone from SAM-3D-Objects, adapted to DECO feature maps.
 
     SAM-3D-Objects' ``ss_encoder.ckpt`` is a voxel VAE encoder and cannot consume an
-    RGB image.  Its image backbone instead lives in the RGB DINO conditioner declared
-    in ``ss_generator.yaml`` and stored under
-    ``_base_models.condition_embedder.module_list.0.backbone`` in
-    ``ss_generator.ckpt``.  This wrapper loads only that frozen visual backbone, then
-    projects its patch features to DECO's channel width and pools them to the body
-    branch's spatial grid.
+    RGB image. Its paired RGB and alpha-mask DINO conditioners live in
+    ``ss_generator.yaml`` under ``module_list.{0,1}.backbone``. This wrapper loads
+    both frozen condition encoders, fuses their spatial patch features, then projects
+    them to DECO's channel width and pools them to the body branch's spatial grid.
 
     ``forward`` returns ``(B, project_to_dim, H_out, W_out)``.  For the default
     256x256 DECO crop this is ``(B, 1280, 16, 16)``, matching
@@ -298,6 +296,7 @@ class SAM3DObjectsEncoder(nn.Module):
             project_to_dim=None,
             output_size=(16, 16),
             image_embedder_index=0,
+            mask_embedder_index=1,
             freeze_backbone=False,
             input_is_normalized=True,
             device='cuda',
@@ -309,6 +308,7 @@ class SAM3DObjectsEncoder(nn.Module):
         self.output_size = output_size
         self.input_is_normalized = input_is_normalized
         self.image_embedder_index = image_embedder_index
+        self.mask_embedder_index = mask_embedder_index
 
         if checkpoint_path is None:
             raise ValueError("checkpoint_path is required")
@@ -321,24 +321,55 @@ class SAM3DObjectsEncoder(nn.Module):
         self.model_cfg, image_cfg = self._load_image_backbone_config(
             config_path, image_embedder_index
         )
+        _, mask_cfg = self._load_image_backbone_config(config_path, mask_embedder_index)
         self.dino_model = image_cfg.get('dino_model', 'dinov2_vitl14_reg')
         self.input_size = image_cfg.get('input_size', 518)
         self.normalize_images = bool(image_cfg.get('normalize_images', True))
         self.repo_or_dir = image_cfg.get('repo_or_dir', 'facebookresearch/dinov2')
         self.source = image_cfg.get('source', 'github')
+        self.mask_dino_model = mask_cfg.get('dino_model', self.dino_model)
+        self.mask_input_size = mask_cfg.get('input_size', self.input_size)
+        self.mask_normalize_images = bool(mask_cfg.get('normalize_images', True))
+        self.mask_repo_or_dir = mask_cfg.get('repo_or_dir', self.repo_or_dir)
+        self.mask_source = mask_cfg.get('source', self.source)
 
         print(
-            f"Loading SAM-3D-Objects RGB DINO ({self.dino_model}) from "
+            f"Loading SAM-3D-Objects RGB/mask DINO "
+            f"({self.dino_model}/{self.mask_dino_model}) from "
             f"{checkpoint_path}"
         )
-        self.backbone = self._build_backbone()
-        self._load_backbone_weights(checkpoint_path, image_embedder_index)
+        self.backbone = self._build_backbone(
+            self.dino_model, self.repo_or_dir, self.source
+        )
+        self.mask_backbone = self._build_backbone(
+            self.mask_dino_model, self.mask_repo_or_dir, self.mask_source
+        )
+        self._load_backbone_weights(
+            checkpoint_path,
+            {
+                image_embedder_index: self.backbone,
+                mask_embedder_index: self.mask_backbone,
+            },
+        )
 
         self.embed_dim = getattr(self.backbone, 'embed_dim', None)
         if self.embed_dim is None:
             raise RuntimeError('SAM-3D-Objects DINO backbone has no embed_dim')
+        self.mask_embed_dim = getattr(self.mask_backbone, 'embed_dim', None)
+        if self.mask_embed_dim is None:
+            raise RuntimeError('SAM-3D-Objects mask DINO backbone has no embed_dim')
         patch_embed = getattr(self.backbone, 'patch_embed', None)
         self.patch_size = getattr(patch_embed, 'patch_size', 14)
+        mask_patch_embed = getattr(self.mask_backbone, 'patch_embed', None)
+        self.mask_patch_size = getattr(mask_patch_embed, 'patch_size', 14)
+
+        # SAM-3D-Objects conditions on RGB and the alpha mask with separate DINO
+        # encoders. DECO needs a spatial map rather than concatenated token streams,
+        # so use a trainable 1x1 fusion before the existing output projection.
+        self.image_mask_fusion = nn.Conv2d(
+            self.embed_dim + self.mask_embed_dim, self.embed_dim, kernel_size=1
+        )
+        self._initialize_image_mask_fusion()
 
         if project_to_dim is not None and project_to_dim != self.embed_dim:
             self.projection = nn.Conv2d(self.embed_dim, project_to_dim, kernel_size=1)
@@ -347,15 +378,18 @@ class SAM3DObjectsEncoder(nn.Module):
 
         if self.freeze_backbone:
             self.backbone.requires_grad_(False)
+            self.mask_backbone.requires_grad_(False)
             self.backbone.eval()
-            # The two frozen ViTs must fit alongside DECO's contact head on an 8GB
-            # RTX 3060 Ti.  Run the SAM-3D-Objects DINO in fp16 on CUDA, but keep
-            # projection/fusion layers in fp32 for stable training.
+            self.mask_backbone.eval()
+            # Run both frozen SAM-3D-Objects DINO conditioners in fp16 on CUDA,
+            # while projection/fusion layers remain fp32 for stable training.
             if str(device).startswith('cuda'):
                 self.backbone.half()
+                self.mask_backbone.half()
             print("✓ SAM-3D-Objects backbone frozen")
 
         self.backbone_dtype = next(self.backbone.parameters()).dtype
+        self.mask_backbone_dtype = next(self.mask_backbone.parameters()).dtype
         self.register_buffer(
             'image_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
             persistent=False,
@@ -367,7 +401,7 @@ class SAM3DObjectsEncoder(nn.Module):
 
     @staticmethod
     def _load_image_backbone_config(config_path, image_embedder_index):
-        """Read the RGB-DINO entry from the local SAM-3D-Objects generator config."""
+        """Read one DINO conditioner entry from the local generator config."""
         try:
             import yaml
         except ImportError as exc:
@@ -399,7 +433,26 @@ class SAM3DObjectsEncoder(nn.Module):
             )
         return config, image_cfg
 
-    def _build_backbone(self):
+    def _initialize_image_mask_fusion(self):
+        """Start fusion as an equal per-channel RGB/mask feature average."""
+        with torch.no_grad():
+            self.image_mask_fusion.weight.zero_()
+            self.image_mask_fusion.bias.zero_()
+            shared_channels = min(self.embed_dim, self.mask_embed_dim)
+            channel_ids = torch.arange(shared_channels)
+            self.image_mask_fusion.weight[channel_ids, channel_ids, 0, 0] = 0.5
+            self.image_mask_fusion.weight[
+                channel_ids, self.embed_dim + channel_ids, 0, 0
+            ] = 0.5
+            if self.embed_dim > shared_channels:
+                channel_ids = torch.arange(shared_channels, self.embed_dim)
+                self.image_mask_fusion.weight[channel_ids, channel_ids, 0, 0] = 1.0
+
+    @staticmethod
+    def _patch_size_value(patch_size):
+        return patch_size[0] if isinstance(patch_size, (tuple, list)) else patch_size
+
+    def _build_backbone(self, dino_model, repo_or_dir, source):
         """Instantiate the DINO module without downloading generic pretrained weights.
 
         SAM-3D-Objects supplies its own DINO weights in ``ss_generator.ckpt``.  Using
@@ -410,13 +463,14 @@ class SAM3DObjectsEncoder(nn.Module):
         local_repos = sorted(hub_dir.glob('facebookresearch_dinov2_*'))
         if local_repos:
             return torch.hub.load(
-                str(local_repos[0]), self.dino_model, source='local', pretrained=False
+                str(local_repos[0]), dino_model, source='local', pretrained=False
             )
         return torch.hub.load(
-            self.repo_or_dir, self.dino_model, source=self.source, pretrained=False
+            repo_or_dir, dino_model, source=source, pretrained=False
         )
 
-    def _load_backbone_weights(self, checkpoint_path, image_embedder_index):
+    def _load_backbone_weights(self, checkpoint_path, backbones_by_index):
+        """Load RGB and mask DINO weights from one mmap-backed checkpoint read."""
         if not checkpoint_path.is_file():
             raise FileNotFoundError(
                 f'SAM-3D-Objects generator checkpoint not found: {checkpoint_path}'
@@ -437,30 +491,31 @@ class SAM3DObjectsEncoder(nn.Module):
                 f'Unsupported SAM-3D-Objects checkpoint format: {checkpoint_path}'
             )
 
-        prefix = (
-            '_base_models.condition_embedder.module_list.'
-            f'{image_embedder_index}.backbone.'
-        )
-        backbone_state = {
-            name[len(prefix):]: value
-            for name, value in state_dict.items()
-            if name.startswith(prefix)
-        }
-        if not backbone_state:
-            raise RuntimeError(
-                'The checkpoint has no SAM-3D-Objects RGB DINO weights under '
-                f'{prefix!r}. Use ss_generator.ckpt, not ss_encoder.ckpt.'
+        for embedder_index, backbone in backbones_by_index.items():
+            prefix = (
+                '_base_models.condition_embedder.module_list.'
+                f'{embedder_index}.backbone.'
             )
+            backbone_state = {
+                name[len(prefix):]: value
+                for name, value in state_dict.items()
+                if name.startswith(prefix)
+            }
+            if not backbone_state:
+                raise RuntimeError(
+                    'The checkpoint has no SAM-3D-Objects DINO weights under '
+                    f'{prefix!r}. Use ss_generator.ckpt, not ss_encoder.ckpt.'
+                )
 
-        incompatible = self.backbone.load_state_dict(backbone_state, strict=False)
-        if incompatible.missing_keys or incompatible.unexpected_keys:
-            raise RuntimeError(
-                'SAM-3D-Objects RGB DINO checkpoint does not match '
-                f'{self.dino_model}; missing={incompatible.missing_keys}, '
-                f'unexpected={incompatible.unexpected_keys}'
-            )
+            incompatible = backbone.load_state_dict(backbone_state, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    'SAM-3D-Objects DINO checkpoint does not match conditioner '
+                    f'index {embedder_index}; missing={incompatible.missing_keys}, '
+                    f'unexpected={incompatible.unexpected_keys}'
+                )
+            del backbone_state
 
-        del backbone_state
         del state_dict
         del checkpoint
 
@@ -469,20 +524,70 @@ class SAM3DObjectsEncoder(nn.Module):
         super().train(mode)
         if self.freeze_backbone:
             self.backbone.eval()
+            self.mask_backbone.eval()
         return self
 
-    def forward(self, x, output_size=None):
-        """Return projected SAM-3D-Objects RGB patch features.
+    @staticmethod
+    def _patch_tokens_to_map(features, image, patch_size, branch_name):
+        if not isinstance(features, dict) or 'x_norm_patchtokens' not in features:
+            raise RuntimeError(
+                f'SAM-3D-Objects {branch_name} DINO must return x_norm_patchtokens '
+                'from forward_features()'
+            )
+        tokens = features['x_norm_patchtokens']
+        patch_size = SAM3DObjectsEncoder._patch_size_value(patch_size)
+        grid_h = image.shape[-2] // patch_size
+        grid_w = image.shape[-1] // patch_size
+        if tokens.shape[1] != grid_h * grid_w:
+            raise RuntimeError(
+                f'SAM-3D-Objects {branch_name} patch-token count does not match its '
+                f'input grid: {tokens.shape[1]} tokens for {grid_h}x{grid_w}'
+            )
+        return tokens.transpose(1, 2).reshape(
+            tokens.shape[0], tokens.shape[2], grid_h, grid_w
+        ).float()
 
-        ``x`` is DECO's ImageNet-normalized image tensor.  SAM-3D-Objects expects
-        raw RGB before applying the same ImageNet normalization, so the tensor is
-        denormalized, resized to its native 518px DINO resolution, and normalized once.
-        ``output_size`` can be supplied by DECO to exactly match the body feature grid.
-        """
+    def _prepare_rgba_inputs(self, x, object_mask):
+        """Recreate SAM-3D-Objects' RGB + ALPHA_CHANNEL input contract."""
         if x.ndim != 4 or x.shape[1] != 3:
             raise ValueError(f'Expected RGB input (B, 3, H, W), got {tuple(x.shape)}')
 
         image = x.float()
+        if object_mask is None:
+            object_mask = image.new_ones((image.shape[0], 1, *image.shape[-2:]))
+        elif object_mask.ndim == 3:
+            object_mask = object_mask.unsqueeze(1)
+        if object_mask.ndim != 4 or object_mask.shape[1] != 1:
+            raise ValueError(
+                'Expected object_mask with shape (B, 1, H, W) or (B, H, W), got '
+                f'{tuple(object_mask.shape)}'
+            )
+        if object_mask.shape[0] != image.shape[0]:
+            raise ValueError(
+                f'Object-mask batch size {object_mask.shape[0]} != image batch size '
+                f'{image.shape[0]}'
+            )
+
+        object_mask = F.interpolate(
+            object_mask.to(device=image.device, dtype=image.dtype),
+            size=image.shape[-2:], mode='nearest',
+        )
+        object_mask = (object_mask > 0).to(dtype=image.dtype)
+        rgba = torch.cat((image, object_mask), dim=1)
+        return rgba[:, :3], rgba[:, 3:4]
+
+    def forward(self, x, object_mask=None, output_size=None):
+        """Return projected SAM-3D-Objects RGB+mask patch features.
+
+        ``x`` is DECO's normalized RGB crop and ``object_mask`` is the corresponding
+        binary foreground mask. The dataset applies the same crop/resize to both;
+        this method then recreates SAM-3D-Objects' RGBA/ALPHA_CHANNEL input contract.
+        """
+        # Preserve the old ``encoder(x, output_size)`` call convention.
+        if output_size is None and isinstance(object_mask, (int, tuple, list)):
+            output_size, object_mask = object_mask, None
+
+        image, alpha_mask = self._prepare_rgba_inputs(x, object_mask)
         mean = self.image_mean.to(dtype=image.dtype, device=image.device)
         std = self.image_std.to(dtype=image.dtype, device=image.device)
         if self.input_is_normalized:
@@ -493,29 +598,35 @@ class SAM3DObjectsEncoder(nn.Module):
         if self.normalize_images:
             image = (image - mean) / std
 
+        # The mask DINO in ss_generator.yaml receives alpha as a one-channel image;
+        # replicate it to RGB and use its own pretrained conditioner weights.
+        mask_image = F.interpolate(
+            alpha_mask, size=(self.mask_input_size, self.mask_input_size),
+            mode='nearest',
+        ).repeat(1, 3, 1, 1)
+        if self.mask_normalize_images:
+            mask_image = (mask_image - mean) / std
+
         backbone_ctx = (
             torch.no_grad() if self.freeze_backbone else contextlib.nullcontext()
         )
         with backbone_ctx:
-            features = self.backbone.forward_features(image.to(self.backbone_dtype))
+            image_features = self.backbone.forward_features(image.to(self.backbone_dtype))
+            mask_features = self.mask_backbone.forward_features(
+                mask_image.to(self.mask_backbone_dtype)
+            )
 
-        if not isinstance(features, dict) or 'x_norm_patchtokens' not in features:
-            raise RuntimeError(
-                'SAM-3D-Objects DINO backbone must return x_norm_patchtokens from '
-                'forward_features()'
+        image_feat = self._patch_tokens_to_map(
+            image_features, image, self.patch_size, 'RGB'
+        )
+        mask_feat = self._patch_tokens_to_map(
+            mask_features, mask_image, self.mask_patch_size, 'alpha-mask'
+        )
+        if mask_feat.shape[-2:] != image_feat.shape[-2:]:
+            mask_feat = F.interpolate(
+                mask_feat, size=image_feat.shape[-2:], mode='bilinear', align_corners=False
             )
-        tokens = features['x_norm_patchtokens']
-        patch_size = self.patch_size[0] if isinstance(self.patch_size, (tuple, list)) else self.patch_size
-        grid_h = image.shape[-2] // patch_size
-        grid_w = image.shape[-1] // patch_size
-        if tokens.shape[1] != grid_h * grid_w:
-            raise RuntimeError(
-                'SAM-3D-Objects patch-token count does not match its input grid: '
-                f'{tokens.shape[1]} tokens for {grid_h}x{grid_w}'
-            )
-        feat = tokens.transpose(1, 2).reshape(
-            tokens.shape[0], tokens.shape[2], grid_h, grid_w
-        ).float()
+        feat = self.image_mask_fusion(torch.cat((image_feat, mask_feat), dim=1))
 
         if self.projection is not None:
             feat = self.projection(feat)

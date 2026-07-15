@@ -93,6 +93,10 @@ class TrainStepper():
         sem_encoder = getattr(self.model, 'encoder_sem', None)
         if getattr(sem_encoder, 'freeze_backbone', False) and hasattr(sem_encoder, 'backbone'):
             self.teacher_shared_prefixes += ('encoder_sem.backbone',)
+            if hasattr(sem_encoder, 'mask_backbone'):
+                # The semantic encoder has a second frozen DINO for the object-mask
+                # alpha channel; share it with the EMA teacher as well.
+                self.teacher_shared_prefixes += ('encoder_sem.mask_backbone',)
         self.teacher = build_teacher(self.model, share_prefix=self.teacher_shared_prefixes)
         self.student_dino_head = DINOHead(feat_dim, out_dim).to(self.device)
         self.teacher_dino_head = build_teacher(self.student_dino_head, share_prefix=None)
@@ -108,6 +112,9 @@ class TrainStepper():
 
         img_paths = batch['img_path']
         img = batch['img'].to(self.device)
+        object_mask = batch.get('object_mask')
+        if object_mask is not None:
+            object_mask = object_mask.to(self.device)
 
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
@@ -148,9 +155,11 @@ class TrainStepper():
 
         # Forward pass
         if self.context:
-            cont, sem_mask_pred, part_mask_pred = self.model(student_img, keypoints)
+            cont, sem_mask_pred, part_mask_pred = self.model(
+                student_img, keypoints=keypoints, object_mask=object_mask
+            )
         else:
-            cont = self.model(student_img)
+            cont = self.model(student_img, keypoints=keypoints, object_mask=object_mask)
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
@@ -190,7 +199,9 @@ class TrainStepper():
             self._distill_step += 1
             student_feat = self.student_feat.feat                  # pooled fused tokens (captured by hook)
             with torch.no_grad():
-                t_out = self.teacher(teacher_img, keypoints)
+                t_out = self.teacher(
+                    teacher_img, keypoints=keypoints, object_mask=object_mask
+                )
                 teacher_cont = t_out[0] if isinstance(t_out, (tuple, list)) else t_out
                 teacher_logits = self.teacher_dino_head(self.teacher_feat.feat) if self.dino_weight > 0 else None
             loss_out = ((cont - teacher_cont) ** 2).mean()         # on-task: output (contact-prob) consistency
@@ -270,6 +281,9 @@ class TrainStepper():
 
         img_paths = batch['img_path']
         img = batch['img'].to(self.device)
+        object_mask = batch.get('object_mask')
+        if object_mask is not None:
+            object_mask = object_mask.to(self.device)
 
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
@@ -303,8 +317,12 @@ class TrainStepper():
 
         # Forward pass
         initial_time = time.time()
-        if self.context: cont, sem_mask_pred, part_mask_pred = self.model(img, keypoints)
-        else: cont = self.model(img, keypoints)
+        if self.context:
+            cont, sem_mask_pred, part_mask_pred = self.model(
+                img, keypoints=keypoints, object_mask=object_mask
+            )
+        else:
+            cont = self.model(img, keypoints=keypoints, object_mask=object_mask)
         time_taken = time.time() - initial_time
 
         if self.context:

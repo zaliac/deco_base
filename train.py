@@ -108,19 +108,49 @@ if __name__ == '__main__':
 
     dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
 
-    train_dataset = MixedDataset(hparams.TRAINING.DATASETS, 'train', dataset_mix_pdf=hparams.TRAINING.DATASET_MIX_PDF, dataset_root_path=dataset_root_path, normalize=hparams.DATASET.NORMALIZE_IMAGES)
+    use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
+    train_dataset = MixedDataset(
+        hparams.TRAINING.DATASETS,
+        'train',
+        dataset_mix_pdf=hparams.TRAINING.DATASET_MIX_PDF,
+        dataset_root_path=dataset_root_path,
+        normalize=hparams.DATASET.NORMALIZE_IMAGES,
+        generate_object_masks=use_sam_object_masks,
+    )
 
     val_datasets = []
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path, normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(
+                ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path,
+                normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                generate_object_masks=use_sam_object_masks,
+            ))
         elif ds in ['damon']:
-            val_datasets.append(BaseDataset(ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path, normalize=hparams.DATASET.NORMALIZE_IMAGES))
+            val_datasets.append(BaseDataset(
+                ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path,
+                normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                generate_object_masks=use_sam_object_masks,
+            ))
         else:
             raise ValueError('Dataset not supported')
 
-    train_loader = DataLoader(train_dataset, hparams.DATASET.BATCH_SIZE, shuffle=True, num_workers=hparams.DATASET.NUM_WORKERS)
-    val_loaders = [DataLoader(val_dataset, batch_size=hparams.DATASET.BATCH_SIZE, shuffle=False, num_workers=hparams.DATASET.NUM_WORKERS) for val_dataset in val_datasets]
+    # SAM is created lazily by BaseDataset.  It must run in the main process: CUDA
+    # cannot be safely initialized by the default forked DataLoader workers after
+    # DECO has already initialized it.  Other encoder modes keep the configured
+    # parallel image loading behavior.
+    data_workers = 0 if use_sam_object_masks else hparams.DATASET.NUM_WORKERS
+    train_loader = DataLoader(
+        train_dataset, hparams.DATASET.BATCH_SIZE, shuffle=True,
+        num_workers=data_workers,
+    )
+    val_loaders = [
+        DataLoader(
+            val_dataset, batch_size=hparams.DATASET.BATCH_SIZE, shuffle=False,
+            num_workers=data_workers,
+        )
+        for val_dataset in val_datasets
+    ]
 
     train(hparams)
 

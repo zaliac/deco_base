@@ -144,7 +144,7 @@ class DECO(nn.Module):
 
         self.device = device
 
-    def forward(self, img, keypoints=None):
+    def forward(self, img, keypoints=None, object_mask=None):
         if self.encoder_type == 'hrnet':
             sem_enc_out = self.encoder_sem(img)
             part_enc_out = self.encoder_part(img)
@@ -205,11 +205,11 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: SAM-3D-Objects RGB DINO -> (B, 1280, Hp, Wp).  Passing
-            # the body grid makes the shape contract explicit instead of relying on a
-            # fixed 16x16 assumption inside the semantic encoder.
+            # semantic branch: SAM-3D-Objects paired RGB/alpha DINO conditioners ->
+            # (B, 1280, Hp, Wp). BaseDataset keeps the object mask pixel-aligned with
+            # img and the encoder reconstructs SAM-3D-Objects' ALPHA_CHANNEL input.
             sem_enc_out_new = self.encoder_sem(
-                img, output_size=part_enc_out.shape[-2:]
+                img, object_mask=object_mask, output_size=part_enc_out.shape[-2:]
             )
 
             if self.context:

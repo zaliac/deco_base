@@ -1,0 +1,128 @@
+import sys
+import tempfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+
+# This project is a script-style repository rather than an installed package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from models.sam3d_encoder import SAM3DObjectsEncoder
+from utils.object_masks import alpha_object_mask, crop_and_resize_object_mask
+from common import constants
+from data.base_dataset import BaseDataset
+
+
+class _DummyDino(nn.Module):
+    """Small forward_features-compatible stand-in; no model checkpoint required."""
+
+    def __init__(self, dim=4, patch_size=2):
+        super().__init__()
+        self.embed_dim = dim
+        self.patch_embed = type('PatchEmbed', (), {'patch_size': patch_size})()
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def forward_features(self, image):
+        self.last_input = image
+        tokens = torch.nn.functional.avg_pool2d(image[:, :1], 2)
+        tokens = tokens.flatten(2).transpose(1, 2)
+        return {'x_norm_patchtokens': tokens.repeat(1, 1, self.embed_dim) * self.scale}
+
+
+def _encoder_for_test():
+    """Build the forward-path state without loading the large SAM checkpoint."""
+    encoder = object.__new__(SAM3DObjectsEncoder)
+    nn.Module.__init__(encoder)
+    encoder.input_is_normalized = True
+    encoder.input_size = encoder.mask_input_size = 8
+    encoder.normalize_images = encoder.mask_normalize_images = True
+    encoder.freeze_backbone = True
+    encoder.backbone = _DummyDino()
+    encoder.mask_backbone = _DummyDino()
+    encoder.backbone_dtype = encoder.mask_backbone_dtype = torch.float32
+    encoder.patch_size = encoder.mask_patch_size = 2
+    encoder.embed_dim = encoder.mask_embed_dim = 4
+    encoder.image_mask_fusion = nn.Conv2d(8, 4, kernel_size=1)
+    encoder.projection = nn.Conv2d(4, 6, kernel_size=1)
+    encoder.output_size = (3, 3)
+    encoder.register_buffer(
+        'image_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    )
+    encoder.register_buffer(
+        'image_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    )
+    return encoder
+
+
+def test_rgba_mask_is_binary_and_tracks_deco_crop():
+    rgba = np.zeros((8, 10, 4), dtype=np.uint8)
+    rgba[2:6, 3:8, 3] = 255
+
+    mask = alpha_object_mask(rgba)
+    resized = crop_and_resize_object_mask(mask, (2, 1, 9, 7), (8, 10), (12, 14))
+
+    assert resized.shape == (12, 14)
+    assert set(np.unique(resized)).issubset({0.0, 1.0})
+    assert resized.sum() > 0
+
+
+def test_object_encoder_consumes_alpha_mask_and_preserves_output_contract():
+    encoder = _encoder_for_test()
+    image = torch.randn(2, 3, 6, 10)
+    object_mask = torch.zeros(2, 1, 6, 10)
+    object_mask[:, :, 2:5, 3:8] = 1
+
+    output = encoder(image, object_mask=object_mask)
+    legacy_output = encoder(image, (2, 2))
+
+    assert output.shape == (2, 6, 3, 3)
+    assert legacy_output.shape == (2, 6, 2, 2)
+    assert encoder.mask_backbone.last_input.shape == (2, 3, 8, 8)
+
+
+class _FakeAutomaticMaskGenerator:
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, rgb_image):
+        self.calls += 1
+        mask = np.zeros(rgb_image.shape[:2], dtype=bool)
+        mask[4:20, 8:24] = True
+        return [{
+            'segmentation': mask,
+            'area': int(mask.sum()),
+            'predicted_iou': 0.99,
+            'stability_score': 0.99,
+        }]
+
+
+def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        image = np.full((24, 32, 3), 127, dtype=np.uint8)
+        assert cv2.imwrite(str(root / 'sample.jpg'), image)
+        annotation_path = root / 'samples.npz'
+        np.savez(
+            annotation_path,
+            imgname=np.array(['sample.jpg']),
+            crop_bbox=np.array([[2, 1, 30, 22]]),
+        )
+        constants.DATASET_FILES.setdefault('train', {})['sam_cache_test'] = str(annotation_path)
+
+        generator = _FakeAutomaticMaskGenerator()
+        dataset = BaseDataset(
+            'sam_cache_test', 'train', dataset_root_path=str(root),
+            normalize=False, sam_mask_generator=generator,
+        )
+        first = dataset[0]
+        second = dataset[0]
+
+        assert generator.calls == 1
+        assert dataset.object_masks[0].shape == (24, 32)
+        assert dataset.object_masks[0].dtype == np.uint8
+        assert first['has_object_mask'].item() == 1.0
+        assert first['object_mask'].shape == (1, 256, 256)
+        assert torch.equal(first['object_mask'], second['object_mask'])
