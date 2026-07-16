@@ -576,13 +576,19 @@ class SAM3DObjectsEncoder(nn.Module):
         rgba = torch.cat((image, object_mask), dim=1)
         return rgba[:, :3], rgba[:, 3:4]
 
-    def forward(self, x, object_mask=None, output_size=None):
+    def forward(self, x, object_mask=None, output_size=None, object_prompt=None):
         """Return projected SAM-3D-Objects RGB+mask patch features.
 
-        ``x`` is DECO's normalized RGB crop and ``object_mask`` is the corresponding
-        binary foreground mask. The dataset applies the same crop/resize to both;
-        this method then recreates SAM-3D-Objects' RGBA/ALPHA_CHANNEL input contract.
+        ``x`` is DECO's normalized RGB crop and ``object_prompt`` is the binary mask
+        produced by Segment Anything from 2D keypoint prompts. The dataset applies
+        the same crop/resize to both; this method then recreates SAM-3D-Objects'
+        RGBA/ALPHA_CHANNEL input contract. ``object_mask`` remains an alias for
+        backwards compatibility.
         """
+        if object_prompt is not None:
+            if object_mask is not None:
+                raise ValueError('Pass either object_prompt or object_mask, not both')
+            object_mask = object_prompt
         # Preserve the old ``encoder(x, output_size)`` call convention.
         if output_size is None and isinstance(object_mask, (int, tuple, list)):
             output_size, object_mask = object_mask, None

@@ -112,9 +112,11 @@ class TrainStepper():
 
         img_paths = batch['img_path']
         img = batch['img'].to(self.device)
-        object_mask = batch.get('object_mask')
-        if object_mask is not None:
-            object_mask = object_mask.to(self.device)
+        # BaseDataset's point-prompted SAM mask is the object prompt supplied to
+        # the SAM-3D-Objects semantic branch alongside the RGB image.
+        object_prompt = batch.get('object_prompt', batch.get('object_mask'))
+        if object_prompt is not None:
+            object_prompt = object_prompt.to(self.device)
 
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
@@ -156,10 +158,10 @@ class TrainStepper():
         # Forward pass
         if self.context:
             cont, sem_mask_pred, part_mask_pred = self.model(
-                student_img, keypoints=keypoints, object_mask=object_mask
+                student_img, keypoints=keypoints, object_prompt=object_prompt
             )
         else:
-            cont = self.model(student_img, keypoints=keypoints, object_mask=object_mask)
+            cont = self.model(student_img, keypoints=keypoints, object_prompt=object_prompt)
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
@@ -200,7 +202,7 @@ class TrainStepper():
             student_feat = self.student_feat.feat                  # pooled fused tokens (captured by hook)
             with torch.no_grad():
                 t_out = self.teacher(
-                    teacher_img, keypoints=keypoints, object_mask=object_mask
+                    teacher_img, keypoints=keypoints, object_prompt=object_prompt
                 )
                 teacher_cont = t_out[0] if isinstance(t_out, (tuple, list)) else t_out
                 teacher_logits = self.teacher_dino_head(self.teacher_feat.feat) if self.dino_weight > 0 else None
@@ -281,9 +283,9 @@ class TrainStepper():
 
         img_paths = batch['img_path']
         img = batch['img'].to(self.device)
-        object_mask = batch.get('object_mask')
-        if object_mask is not None:
-            object_mask = object_mask.to(self.device)
+        object_prompt = batch.get('object_prompt', batch.get('object_mask'))
+        if object_prompt is not None:
+            object_prompt = object_prompt.to(self.device)
 
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
@@ -319,10 +321,10 @@ class TrainStepper():
         initial_time = time.time()
         if self.context:
             cont, sem_mask_pred, part_mask_pred = self.model(
-                img, keypoints=keypoints, object_mask=object_mask
+                img, keypoints=keypoints, object_prompt=object_prompt
             )
         else:
-            cont = self.model(img, keypoints=keypoints, object_mask=object_mask)
+            cont = self.model(img, keypoints=keypoints, object_prompt=object_prompt)
         time_taken = time.time() - initial_time
 
         if self.context:

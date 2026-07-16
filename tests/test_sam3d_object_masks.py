@@ -75,7 +75,7 @@ def test_object_encoder_consumes_alpha_mask_and_preserves_output_contract():
     object_mask = torch.zeros(2, 1, 6, 10)
     object_mask[:, :, 2:5, 3:8] = 1
 
-    output = encoder(image, object_mask=object_mask)
+    output = encoder(image, object_prompt=object_mask)
     legacy_output = encoder(image, (2, 2))
 
     assert output.shape == (2, 6, 3, 3)
@@ -97,6 +97,33 @@ class _FakeAutomaticMaskGenerator:
             'predicted_iou': 0.99,
             'stability_score': 0.99,
         }]
+
+
+class _FakePointPromptPredictor:
+    """Small SamPredictor-compatible fake that records the supplied prompts."""
+
+    def __init__(self):
+        self.set_image_calls = 0
+        self.predict_calls = 0
+        self.point_coords = None
+        self.point_labels = None
+        self.multimask_output = None
+        self.image_shape = None
+
+    def set_image(self, rgb_image):
+        self.set_image_calls += 1
+        self.image_shape = rgb_image.shape[:2]
+
+    def predict(self, point_coords, point_labels, multimask_output):
+        self.predict_calls += 1
+        self.point_coords = point_coords.copy()
+        self.point_labels = point_labels.copy()
+        self.multimask_output = multimask_output
+        masks = np.zeros((3, *self.image_shape), dtype=bool)
+        masks[0, 1:4, 1:4] = True
+        masks[1, 4:20, 8:24] = True
+        masks[2, 2:18, 4:20] = True
+        return masks, np.asarray([0.2, 0.95, 0.6]), None
 
 
 def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
@@ -125,4 +152,53 @@ def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
         assert dataset.object_masks[0].dtype == np.uint8
         assert first['has_object_mask'].item() == 1.0
         assert first['object_mask'].shape == (1, 256, 256)
+        assert torch.equal(first['object_mask'], second['object_mask'])
+
+
+def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        image = np.full((24, 32, 3), 127, dtype=np.uint8)
+        assert cv2.imwrite(str(root / 'sample.jpg'), image)
+
+        keypoints = np.zeros((17, 2), dtype=np.float32)
+        keypoints[0] = (10, 5)      # valid
+        keypoints[1] = (12, 8)      # valid
+        keypoints[2] = (40, 8)      # outside image
+        keypoints[3] = (8, 18)      # below confidence threshold
+        confidence = np.zeros(17, dtype=np.float32)
+        confidence[:4] = (0.9, 0.4, 0.9, 0.2)
+
+        annotation_path = root / 'samples_with_keypoints.npz'
+        np.savez(
+            annotation_path,
+            imgname=np.array(['sample.jpg']),
+            crop_bbox=np.array([[2, 1, 30, 22]]),
+            keypoint_2d=keypoints[None],
+            keypoint_conf=confidence[None],
+        )
+        monkeypatch.setitem(
+            constants.DATASET_FILES.setdefault('train', {}),
+            'sam_point_prompt_test', str(annotation_path),
+        )
+
+        predictor = _FakePointPromptPredictor()
+        dataset = BaseDataset(
+            'sam_point_prompt_test', 'train', dataset_root_path=str(root),
+            normalize=False, sam_predictor=predictor,
+        )
+        first = dataset[0]
+        second = dataset[0]
+
+        # SamPredictor sees original-image coordinates, before DECO's person crop.
+        np.testing.assert_array_equal(
+            predictor.point_coords, np.asarray([[10, 5], [12, 8]], dtype=np.float32)
+        )
+        np.testing.assert_array_equal(predictor.point_labels, np.asarray([1, 1], dtype=np.int32))
+        assert predictor.multimask_output is True
+        assert predictor.set_image_calls == predictor.predict_calls == 1
+        assert dataset.object_masks[0].shape == (24, 32)
+        assert first['has_object_mask'].item() == 1.0
+        assert torch.equal(first['object_prompt'], first['object_mask'])
+        assert first['object_mask'].sum().item() > 0
         assert torch.equal(first['object_mask'], second['object_mask'])
