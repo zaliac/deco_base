@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import tempfile
 from pathlib import Path
@@ -126,6 +127,27 @@ class _FakePointPromptPredictor:
         return masks, np.asarray([0.2, 0.95, 0.6]), None
 
 
+class _FakeContactProposalGenerator:
+    """Automatic-SAM proposals: person, nearby object, and distant distractor."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate(self, rgb_image):
+        self.calls += 1
+        human = np.zeros(rgb_image.shape[:2], dtype=bool)
+        human[4:20, 8:24] = True
+        nearby_object = np.zeros_like(human)
+        nearby_object[4:20, 24:31] = True
+        distant_object = np.zeros_like(human)
+        distant_object[48:56, 0:8] = True
+        return [
+            {'segmentation': human, 'predicted_iou': 0.99, 'stability_score': 0.99},
+            {'segmentation': nearby_object, 'predicted_iou': 0.90, 'stability_score': 0.90},
+            {'segmentation': distant_object, 'predicted_iou': 0.99, 'stability_score': 0.99},
+        ]
+
+
 def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -158,13 +180,13 @@ def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
 def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        image = np.full((24, 32, 3), 127, dtype=np.uint8)
+        image = np.full((64, 80, 3), 127, dtype=np.uint8)
         assert cv2.imwrite(str(root / 'sample.jpg'), image)
 
         keypoints = np.zeros((17, 2), dtype=np.float32)
         keypoints[0] = (10, 5)      # valid
         keypoints[1] = (12, 8)      # valid
-        keypoints[2] = (40, 8)      # outside image
+        keypoints[2] = (100, 8)     # outside image
         keypoints[3] = (8, 18)      # below confidence threshold
         confidence = np.zeros(17, dtype=np.float32)
         confidence[:4] = (0.9, 0.4, 0.9, 0.2)
@@ -173,7 +195,7 @@ def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
         np.savez(
             annotation_path,
             imgname=np.array(['sample.jpg']),
-            crop_bbox=np.array([[2, 1, 30, 22]]),
+            crop_bbox=np.array([[2, 1, 78, 62]]),
             keypoint_2d=keypoints[None],
             keypoint_conf=confidence[None],
         )
@@ -183,9 +205,10 @@ def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
         )
 
         predictor = _FakePointPromptPredictor()
+        generator = _FakeContactProposalGenerator()
         dataset = BaseDataset(
             'sam_point_prompt_test', 'train', dataset_root_path=str(root),
-            normalize=False, sam_predictor=predictor,
+            normalize=False, sam_predictor=predictor, sam_mask_generator=generator,
         )
         first = dataset[0]
         second = dataset[0]
@@ -197,8 +220,58 @@ def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
         np.testing.assert_array_equal(predictor.point_labels, np.asarray([1, 1], dtype=np.int32))
         assert predictor.multimask_output is True
         assert predictor.set_image_calls == predictor.predict_calls == 1
-        assert dataset.object_masks[0].shape == (24, 32)
+        assert generator.calls == 1
+        assert dataset.object_masks[0].shape == (64, 80)
         assert first['has_object_mask'].item() == 1.0
         assert torch.equal(first['object_prompt'], first['object_mask'])
         assert first['object_mask'].sum().item() > 0
+        # The high-scoring human proposal is excluded; only the adjacent object is
+        # retained in original image coordinates before DECO's crop/resize.
+        assert dataset.object_masks[0][4:20, 8:24].sum() == 0
+        assert dataset.object_masks[0][4:20, 24:31].sum() > 0
+        assert dataset.object_masks[0][48:56, 0:8].sum() == 0
         assert torch.equal(first['object_mask'], second['object_mask'])
+
+
+def test_offline_precompute_uses_the_same_non_person_contact_selection():
+    script_path = Path(__file__).resolve().parents[1] / 'tools' / 'precompute_dataset_object_masks.py'
+    spec = importlib.util.spec_from_file_location('precompute_dataset_object_masks', script_path)
+    precompute = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(precompute)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        image = np.full((64, 80, 3), 127, dtype=np.uint8)
+        assert cv2.imwrite(str(root / 'sample.jpg'), image)
+        keypoints = np.zeros((1, 17, 2), dtype=np.float32)
+        keypoints[0, :2] = ((10, 5), (12, 8))
+        confidence = np.zeros((1, 17), dtype=np.float32)
+        confidence[0, :2] = (0.9, 0.4)
+        annotations_path = root / 'samples.npz'
+        np.savez(
+            annotations_path,
+            imgname=np.array(['sample.jpg']),
+            keypoint_2d=keypoints,
+            keypoint_conf=confidence,
+        )
+
+        output_dir = root / 'masks'
+        output_annotations = root / 'samples_with_masks.npz'
+        count = precompute.precompute_masks(
+            annotations_path,
+            root,
+            output_dir,
+            output_annotations,
+            _FakeContactProposalGenerator(),
+            sam_predictor=_FakePointPromptPredictor(),
+        )
+
+        assert count == 1
+        with np.load(output_annotations, allow_pickle=True) as result:
+            mask_path = root / str(result['object_mask_path'][0])
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        assert mask is not None
+        assert mask[4:20, 8:24].sum() == 0
+        assert mask[4:20, 24:31].sum() > 0
+        assert mask[48:56, 0:8].sum() == 0

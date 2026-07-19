@@ -145,7 +145,7 @@ class DECO(nn.Module):
         self.device = device
 
     def forward(self, img, keypoints=None, object_mask=None, object_prompt=None):
-        # ``object_prompt`` is the point-prompted SAM binary mask. Keep
+        # ``object_prompt`` is the task-6 contact-object SAM binary mask. Keep
         # ``object_mask`` as a backwards-compatible alias for existing callers.
         if object_prompt is not None:
             if object_mask is not None:
@@ -211,7 +211,7 @@ class DECO(nn.Module):
             # prompt tokens (B, N, 1280) from the native (pretrained) PromptEncoder.
             part_enc_out, prompt_tokens = self.encoder_part(img, keypoints)
 
-            # semantic branch: the RGB crop plus SAM's keypoint-prompted object mask
+            # semantic branch: the RGB crop plus the nearby non-person object mask
             # form SAM-3D-Objects' RGB/alpha condition input.
             sem_enc_out_new = self.encoder_sem(
                 img, object_prompt=object_mask, output_size=part_enc_out.shape[-2:]

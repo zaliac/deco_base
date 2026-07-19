@@ -579,9 +579,9 @@ class SAM3DObjectsEncoder(nn.Module):
     def forward(self, x, object_mask=None, output_size=None, object_prompt=None):
         """Return projected SAM-3D-Objects RGB+mask patch features.
 
-        ``x`` is DECO's normalized RGB crop and ``object_prompt`` is the binary mask
-        produced by Segment Anything from 2D keypoint prompts. The dataset applies
-        the same crop/resize to both; this method then recreates SAM-3D-Objects'
+        ``x`` is DECO's normalized RGB crop and ``object_prompt`` is the binary
+        task-6 mask for nearby non-person SAM proposals. The dataset applies the
+        same crop/resize to both; this method then recreates SAM-3D-Objects'
         RGBA/ALPHA_CHANNEL input contract. ``object_mask`` remains an alias for
         backwards compatibility.
         """

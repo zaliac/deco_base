@@ -10,7 +10,11 @@ from utils.object_masks import (
     alpha_object_mask,
     binary_object_mask,
     crop_and_resize_object_mask,
+    keypoints_to_sam_points,
     load_object_mask,
+    select_contact_object_mask,
+    select_prompted_sam_mask,
+    select_sam_object_mask,
 )
 
 def mask_split(img, num_parts):
@@ -38,6 +42,8 @@ class BaseDataset(Dataset):
             sam_predictor=None,
             sam_prompt_confidence=0.3,
             sam_multimask_output=True,
+            sam_automatic_mask_kwargs=None,
+            sam_contact_max_candidates=3,
     ):
         self.dataset = dataset
         self.mode = mode
@@ -98,8 +104,6 @@ class BaseDataset(Dataset):
                 self.object_mask_key = key
                 break
 
-        if sam_mask_generator is not None and sam_predictor is not None:
-            raise ValueError('Pass either sam_predictor or the legacy sam_mask_generator, not both')
         self.generate_object_masks = bool(
             generate_object_masks
             or sam_predictor is not None
@@ -112,15 +116,19 @@ class BaseDataset(Dataset):
             or Path(__file__).resolve().parents[1]
             / 'data/weights/sam/sam_vit_b_01ec64.pth'
         )
-        # Task 5 uses SamPredictor with the stored human 2D keypoints as positive
-        # point prompts. The legacy generator hook remains only so older callers
-        # can still provide an already-built automatic-mask generator.
+        # Task 6 uses the predictor for a human mask and an automatic generator for
+        # nearby non-human proposals. Both can share the same underlying SAM model.
         self._sam_predictor = sam_predictor
-        self._legacy_sam_mask_generator = sam_mask_generator
+        self._sam_mask_generator = sam_mask_generator
+        self._has_external_sam_mask_generator = sam_mask_generator is not None
         self.sam_prompt_confidence = float(sam_prompt_confidence)
         if not 0.0 <= self.sam_prompt_confidence <= 1.0:
             raise ValueError('sam_prompt_confidence must be in [0, 1]')
         self.sam_multimask_output = bool(sam_multimask_output)
+        self.sam_automatic_mask_kwargs = dict(sam_automatic_mask_kwargs or {})
+        self.sam_contact_max_candidates = int(sam_contact_max_candidates)
+        if self.sam_contact_max_candidates < 1:
+            raise ValueError('sam_contact_max_candidates must be at least one')
 
         # Optional per-image person-crop bbox [x0,y0,x1,y1] in original-image pixels.
         # Used by datasets whose images are not person-centric (e.g. BEHAVE full
@@ -152,119 +160,98 @@ class BaseDataset(Dataset):
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
 
     def _get_sam_predictor(self):
-        """Lazily load the point-prompted SAM predictor when it is needed."""
+        """Lazily obtain a SAM predictor for the keypoint-derived human mask."""
         if self._sam_predictor is not None:
             return self._sam_predictor
         if not self.generate_object_masks:
             return None
-        # A supplied task-4 generator is a compatibility fallback only; do not load
-        # a second SAM model when no point-prompted predictor was requested.
-        if self._legacy_sam_mask_generator is not None:
+
+        # A supplied SamAutomaticMaskGenerator already owns a SAM model. Reuse it
+        # rather than loading a second model just to segment the person.
+        generator_predictor = getattr(self._sam_mask_generator, 'predictor', None)
+        shared_model = getattr(generator_predictor, 'model', None)
+        if shared_model is not None:
+            try:
+                from segment_anything import SamPredictor
+            except ImportError as exc:
+                raise ImportError(
+                    'Task-6 contact-object masks require segment-anything. Install the '
+                    'project requirements before training.'
+                ) from exc
+            self._sam_predictor = SamPredictor(shared_model)
+            return self._sam_predictor
+
+        # Generic task-4 generators may not expose their model. Preserve that
+        # caller's fallback without implicitly allocating a second SAM model.
+        if self._has_external_sam_mask_generator:
             return None
         if not self.sam_checkpoint_path.is_file():
             raise FileNotFoundError(
-                'SAM checkpoint required for point-prompted object masks was not found: '
+                'SAM checkpoint required for task-6 contact-object masks was not found: '
                 f'{self.sam_checkpoint_path}'
             )
         try:
             from segment_anything import SamPredictor, sam_model_registry
         except ImportError as exc:
             raise ImportError(
-                'Point-prompted SAM object masks require segment-anything. Install the '
+                'Task-6 contact-object masks require segment-anything. Install the '
                 'project requirements before training.'
             ) from exc
 
         print(
-            f'Loading SAM point-prompt predictor ({self.sam_model_type}) on '
+            f'Loading SAM human-mask predictor ({self.sam_model_type}) on '
             f'{self.sam_device}'
         )
-        sam = sam_model_registry[self.sam_model_type](
-            checkpoint=str(self.sam_checkpoint_path)
-        )
+        sam = sam_model_registry[self.sam_model_type](checkpoint=str(self.sam_checkpoint_path))
         sam.to(device=self.sam_device)
         sam.eval()
         self._sam_predictor = SamPredictor(sam)
         return self._sam_predictor
 
+    def _get_sam_mask_generator(self):
+        """Lazily build automatic proposals, sharing the predictor's SAM model."""
+        if self._sam_mask_generator is not None:
+            return self._sam_mask_generator
+        predictor = self._get_sam_predictor()
+        shared_model = getattr(predictor, 'model', None)
+        if shared_model is None:
+            return None
+        try:
+            from segment_anything import SamAutomaticMaskGenerator
+        except ImportError as exc:
+            raise ImportError(
+                'Task-6 contact-object masks require segment-anything. Install the '
+                'project requirements before training.'
+            ) from exc
+        self._sam_mask_generator = SamAutomaticMaskGenerator(
+            shared_model, **self.sam_automatic_mask_kwargs
+        )
+        return self._sam_mask_generator
+
     @staticmethod
     def _select_sam_object_mask(annotations, source_size):
-        """Choose the highest-quality non-background automatic-SAM proposal."""
-        source_area = int(source_size[0]) * int(source_size[1])
-        candidates = []
-        for annotation in annotations:
-            segmentation = annotation.get('segmentation') if isinstance(annotation, dict) else None
-            if segmentation is None:
-                continue
-            area = int(annotation.get('area', np.count_nonzero(segmentation)))
-            # Ignore tiny fragments and an all-image/background proposal.
-            if area < 100 or area > 0.98 * source_area:
-                continue
-            candidates.append((annotation, segmentation, area))
-
-        if not candidates:
-            return None
-        _, segmentation, _ = max(
-            candidates,
-            key=lambda candidate: (
-                candidate[0].get('predicted_iou', 0.0),
-                candidate[0].get('stability_score', 0.0),
-                candidate[2],
-            ),
-        )
-        return binary_object_mask(segmentation)
+        """Choose a generic automatic-SAM proposal for legacy task-4 callers."""
+        return select_sam_object_mask(annotations, source_size)
 
     def _sam_point_prompt(self, index, source_size):
         """Return valid COCO keypoints as SAM positive point prompts in image pixels."""
         if self.keypoints_2d is None or not self.has_keypoints[index]:
             return None, None
-
-        points = np.asarray(self.keypoints_2d[index], dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] < 2:
-            return None, None
-        points = points[:, :2]
-        confidence = np.ones(points.shape[0], dtype=np.float32)
-        if self.keypoint_conf is not None:
-            raw_confidence = np.asarray(self.keypoint_conf[index], dtype=np.float32)
-            if raw_confidence.ndim == 1:
-                n_confidence = min(points.shape[0], raw_confidence.shape[0])
-                confidence[:] = 0.0
-                confidence[:n_confidence] = raw_confidence[:n_confidence]
-
-        source_h, source_w = int(source_size[0]), int(source_size[1])
-        valid = (
-            np.isfinite(points).all(axis=1)
-            & np.isfinite(confidence)
-            & (confidence >= self.sam_prompt_confidence)
-            & (points[:, 0] >= 0) & (points[:, 0] < source_w)
-            & (points[:, 1] >= 0) & (points[:, 1] < source_h)
+        confidence = self.keypoint_conf[index] if self.keypoint_conf is not None else None
+        return keypoints_to_sam_points(
+            self.keypoints_2d[index],
+            confidence,
+            source_size,
+            confidence_threshold=self.sam_prompt_confidence,
         )
-        if not np.any(valid):
-            return None, None
-
-        point_coords = np.ascontiguousarray(points[valid], dtype=np.float32)
-        # Segment Anything uses 1 for a positive point and 0 for a negative point.
-        point_labels = np.ones(point_coords.shape[0], dtype=np.int32)
-        return point_coords, point_labels
 
     @staticmethod
     def _select_prompted_sam_mask(masks, scores):
         """Choose the highest-confidence mask returned by SamPredictor.predict."""
-        masks = np.asarray(masks)
-        if masks.ndim == 2:
-            return binary_object_mask(masks)
-        if masks.ndim != 3 or masks.shape[0] == 0:
-            return None
-
-        scores = np.asarray(scores).reshape(-1)
-        if scores.size == masks.shape[0]:
-            finite_scores = np.where(np.isfinite(scores), scores, -np.inf)
-            mask_index = int(np.argmax(finite_scores)) if np.isfinite(finite_scores).any() else 0
-        else:
-            mask_index = 0
-        return binary_object_mask(masks[mask_index])
+        return select_prompted_sam_mask(masks, scores)
 
     def _generate_object_mask(self, index, image_with_alpha, source_size):
-        """Use 2D-keypoint point prompts to segment an object in the full image."""
+        """Generate non-person SAM masks around the keypoint-derived body mask."""
         point_coords, point_labels = self._sam_point_prompt(index, source_size)
         if point_coords is not None:
             predictor = self._get_sam_predictor()
@@ -277,55 +264,87 @@ class BaseDataset(Dataset):
                         point_labels=point_labels,
                         multimask_output=self.sam_multimask_output,
                     )
-                return self._select_prompted_sam_mask(masks, scores)
+                human_mask = self._select_prompted_sam_mask(masks, scores)
+                generator = self._get_sam_mask_generator()
+                if human_mask is not None and generator is not None:
+                    # The automatic generator owns another predictor. Free the
+                    # keypoint-predictor embedding before it creates its own image
+                    # features, avoiding two full image embeddings on GPU at once.
+                    reset_image = getattr(predictor, 'reset_image', None)
+                    if callable(reset_image):
+                        reset_image()
+                    with torch.no_grad():
+                        annotations = (
+                            generator.generate(rgb_image)
+                            if hasattr(generator, 'generate') else generator(rgb_image)
+                        )
+                    return select_contact_object_mask(
+                        annotations,
+                        human_mask,
+                        source_size,
+                        max_candidates=self.sam_contact_max_candidates,
+                    )
 
-        # Kept for callers constructed against the task-4 API. New sam_sam runs use
-        # SamPredictor above and never instantiate an automatic-mask generator.
-        generator = self._legacy_sam_mask_generator
-        if generator is None:
-            return None
+                # Never return the person mask when no automatic object proposal is
+                # available; that was precisely the task-5 failure mode.
+                return None
 
-        rgb_image = cv2.cvtColor(image_with_alpha[:, :, :3], cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            annotations = (
-                generator.generate(rgb_image)
-                if hasattr(generator, 'generate') else generator(rgb_image)
-            )
-        if isinstance(annotations, np.ndarray):
-            return binary_object_mask(annotations)
-        if not annotations:
-            return None
-        return self._select_sam_object_mask(annotations, source_size)
+        # Retain explicit task-4 generator support for code with no keypoints. Normal
+        # sam_sam training does not enter this path: it uses a localized human mask
+        # and returns an empty alpha prompt if no nearby object is credible.
+        if (
+            point_coords is None
+            and self._has_external_sam_mask_generator
+            and self._sam_predictor is None
+        ):
+            rgb_image = cv2.cvtColor(image_with_alpha[:, :, :3], cv2.COLOR_BGR2RGB)
+            with torch.no_grad():
+                annotations = (
+                    self._sam_mask_generator.generate(rgb_image)
+                    if hasattr(self._sam_mask_generator, 'generate')
+                    else self._sam_mask_generator(rgb_image)
+                )
+            return self._select_sam_object_mask(annotations, source_size)
+        return None
 
     def _object_mask_for_image(self, index, image_with_alpha, source_size, crop_bbox):
         """Resolve/cache a mask, then mirror the RGB crop/resize exactly."""
         mask = self.object_masks[index]
-        has_object_mask = mask is not None
+        has_object_mask = mask is not None and bool(np.any(mask))
 
         if mask is None and self.object_mask_sources is not None:
             try:
                 mask = load_object_mask(
                     self.object_mask_sources[index], dataset_root=self.dataset_base_path
                 )
-                has_object_mask = True
+                has_object_mask = bool(np.any(mask))
             except (FileNotFoundError, ValueError, TypeError, cv2.error) as exc:
                 print(f'Object mask ({self.object_mask_key}): {exc}')
 
         if mask is None:
             mask = alpha_object_mask(image_with_alpha)
-            has_object_mask = mask is not None
+            has_object_mask = mask is not None and bool(np.any(mask))
 
         if mask is None and self.generate_object_masks:
             mask = self._generate_object_mask(index, image_with_alpha, source_size)
-            has_object_mask = mask is not None
+            has_object_mask = mask is not None and bool(np.any(mask))
 
         if mask is not None:
             # Store uint8 to keep a large dataset's in-memory SAM cache compact.
             mask = binary_object_mask(mask)
             self.object_masks[index] = mask.astype(np.uint8, copy=False)
         else:
-            # Explicitly disabled SAM retains the legacy full-image behavior.
-            mask = np.ones(source_size, dtype=np.float32)
+            # An empty task-6 alpha prompt is safer than reusing the person/scene as
+            # a false object. Explicitly disabled SAM retains full-image behavior.
+            mask = (
+                np.zeros(source_size, dtype=np.float32)
+                if self.generate_object_masks
+                else np.ones(source_size, dtype=np.float32)
+            )
+            if self.generate_object_masks:
+                # Cache a failed/no-nearby-object result too: retrying SAM for it on
+                # every epoch wastes substantial GPU time and cannot improve it.
+                self.object_masks[index] = mask.astype(np.uint8, copy=False)
 
         mask = crop_and_resize_object_mask(
             mask,
@@ -450,8 +469,8 @@ class BaseDataset(Dataset):
         item['sem_mask'] = torch.tensor(sem_mask, dtype=torch.float32)
         item['part_mask'] = torch.tensor(part_mask, dtype=torch.float32)
         item['polygon_contact_2d'] = torch.tensor(polygon_contact_2d, dtype=torch.float32)
-        # Binary [1, 256, 256] SAM point-prompt output, pixel-aligned with img.
-        # ``object_mask`` remains available for task-4/checkpoint compatibility.
+        # Binary [1, 256, 256] nearby non-person SAM proposal, pixel-aligned with
+        # img. ``object_mask`` remains available for task-4/checkpoint compatibility.
         object_prompt = torch.tensor(object_mask[None], dtype=torch.float32)
         item['object_prompt'] = object_prompt
         item['object_mask'] = object_prompt
