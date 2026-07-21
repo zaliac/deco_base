@@ -145,8 +145,8 @@ class DECO(nn.Module):
         self.device = device
 
     def forward(self, img, keypoints=None, object_mask=None, object_prompt=None):
-        # ``object_prompt`` is the task-6 contact-object SAM binary mask. Keep
-        # ``object_mask`` as a backwards-compatible alias for existing callers.
+        # ``object_prompt`` is the human-removed union of Task-6 keypoint-circle
+        # SAM masks. Keep ``object_mask`` as a backwards-compatible alias.
         if object_prompt is not None:
             if object_mask is not None:
                 raise ValueError('Pass either object_prompt or object_mask, not both')

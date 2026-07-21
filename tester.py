@@ -51,18 +51,23 @@ if __name__ == '__main__':
     val_datasets = []
     use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
     dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
+    sam_object_mask_kwargs = {
+        'generate_object_masks': use_sam_object_masks,
+        'sam_keypoint_circle_radius': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS,
+        'sam_keypoint_circle_points': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS,
+    }
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
-                generate_object_masks=use_sam_object_masks,
+                **sam_object_mask_kwargs,
             ))
         elif ds in ['damon', 'behave']:
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
-                generate_object_masks=use_sam_object_masks,
+                **sam_object_mask_kwargs,
             ))
         else:
             raise ValueError('Dataset not supported')

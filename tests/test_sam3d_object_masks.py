@@ -101,15 +101,18 @@ class _FakeAutomaticMaskGenerator:
 
 
 class _FakePointPromptPredictor:
-    """Small SamPredictor-compatible fake that records the supplied prompts."""
+    """Fake predictor whose circle masks include a removable human region."""
 
     def __init__(self):
         self.set_image_calls = 0
         self.predict_calls = 0
         self.point_coords = None
         self.point_labels = None
+        self.point_coords_history = []
+        self.point_labels_history = []
         self.multimask_output = None
         self.image_shape = None
+        self.reset_image_calls = 0
 
     def set_image(self, rgb_image):
         self.set_image_calls += 1
@@ -119,16 +122,31 @@ class _FakePointPromptPredictor:
         self.predict_calls += 1
         self.point_coords = point_coords.copy()
         self.point_labels = point_labels.copy()
+        self.point_coords_history.append(point_coords.copy())
+        self.point_labels_history.append(point_labels.copy())
         self.multimask_output = multimask_output
         masks = np.zeros((3, *self.image_shape), dtype=bool)
         masks[0, 1:4, 1:4] = True
-        masks[1, 4:20, 8:24] = True
+        human_mask = np.zeros(self.image_shape, dtype=bool)
+        human_mask[10:44, 10:62] = True
+        masks[1] = human_mask
+        if point_coords.shape == (2, 2):
+            pass  # Global all-keypoint prompt: return the human mask itself.
+        elif np.allclose(point_coords[0], (20, 20)):
+            masks[1, 18:30, 62:74] = True
+        elif np.allclose(point_coords[0], (50, 35)):
+            masks[1, 44:56, 45:59] = True
+        else:
+            masks[1, 4:20, 62:74] = True
         masks[2, 2:18, 4:20] = True
         return masks, np.asarray([0.2, 0.95, 0.6]), None
 
+    def reset_image(self):
+        self.reset_image_calls += 1
+
 
 class _FakeContactProposalGenerator:
-    """Automatic-SAM proposals: person, nearby object, and distant distractor."""
+    """Legacy automatic generator used to verify Option 1 does not call it."""
 
     def __init__(self):
         self.calls = 0
@@ -177,15 +195,15 @@ def test_dataset_generates_and_caches_sam_mask_when_image_has_no_alpha():
         assert torch.equal(first['object_mask'], second['object_mask'])
 
 
-def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
+def test_dataset_uses_independent_keypoint_circle_prompts(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         image = np.full((64, 80, 3), 127, dtype=np.uint8)
         assert cv2.imwrite(str(root / 'sample.jpg'), image)
 
         keypoints = np.zeros((17, 2), dtype=np.float32)
-        keypoints[0] = (10, 5)      # valid
-        keypoints[1] = (12, 8)      # valid
+        keypoints[0] = (20, 20)     # valid
+        keypoints[1] = (50, 35)     # valid
         keypoints[2] = (100, 8)     # outside image
         keypoints[3] = (8, 18)      # below confidence threshold
         confidence = np.zeros(17, dtype=np.float32)
@@ -213,27 +231,47 @@ def test_dataset_uses_original_2d_keypoints_as_sam_point_prompts(monkeypatch):
         first = dataset[0]
         second = dataset[0]
 
-        # SamPredictor sees original-image coordinates, before DECO's person crop.
+        # SAM first sees all keypoint centers for the human mask, then one
+        # original-image circle per valid keypoint, before DECO's crop.
+        assert predictor.set_image_calls == 1
+        assert predictor.predict_calls == 3
+        assert predictor.reset_image_calls == 1
+        expected_centers = ((20, 20), (50, 35))
         np.testing.assert_array_equal(
-            predictor.point_coords, np.asarray([[10, 5], [12, 8]], dtype=np.float32)
+            predictor.point_coords_history[0], np.asarray(expected_centers, dtype=np.float32)
         )
-        np.testing.assert_array_equal(predictor.point_labels, np.asarray([1, 1], dtype=np.int32))
+        np.testing.assert_array_equal(predictor.point_labels_history[0], np.ones(2, dtype=np.int32))
+        assert len(predictor.point_coords_history) == len(expected_centers) + 1
+        for point_coords, point_labels, center in zip(
+            predictor.point_coords_history[1:],
+            predictor.point_labels_history[1:],
+            expected_centers,
+        ):
+            np.testing.assert_array_equal(point_coords[0], np.asarray(center, dtype=np.float32))
+            assert point_coords.shape == (9, 2)  # center + eight radius-12 samples
+            np.testing.assert_allclose(
+                np.linalg.norm(point_coords[1:] - point_coords[0], axis=1),
+                12.0,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            np.testing.assert_array_equal(point_labels, np.ones(9, dtype=np.int32))
         assert predictor.multimask_output is True
-        assert predictor.set_image_calls == predictor.predict_calls == 1
-        assert generator.calls == 1
+        # Option 1 does not use automatic-SAM body-adjacent proposal selection.
+        assert generator.calls == 0
         assert dataset.object_masks[0].shape == (64, 80)
         assert first['has_object_mask'].item() == 1.0
         assert torch.equal(first['object_prompt'], first['object_mask'])
         assert first['object_mask'].sum().item() > 0
-        # The high-scoring human proposal is excluded; only the adjacent object is
-        # retained in original image coordinates before DECO's crop/resize.
-        assert dataset.object_masks[0][4:20, 8:24].sum() == 0
-        assert dataset.object_masks[0][4:20, 24:31].sum() > 0
-        assert dataset.object_masks[0][48:56, 0:8].sum() == 0
+        # Every selected circle mask contains the body, but the body is removed
+        # after union while each non-human object region is retained.
+        assert dataset.object_masks[0][18:30, 62:74].sum() > 0
+        assert dataset.object_masks[0][44:56, 45:59].sum() > 0
+        assert dataset.object_masks[0][10:44, 10:62].sum() == 0
         assert torch.equal(first['object_mask'], second['object_mask'])
 
 
-def test_offline_precompute_uses_the_same_non_person_contact_selection():
+def test_offline_precompute_uses_the_same_keypoint_circle_masks():
     script_path = Path(__file__).resolve().parents[1] / 'tools' / 'precompute_dataset_object_masks.py'
     spec = importlib.util.spec_from_file_location('precompute_dataset_object_masks', script_path)
     precompute = importlib.util.module_from_spec(spec)
@@ -245,7 +283,7 @@ def test_offline_precompute_uses_the_same_non_person_contact_selection():
         image = np.full((64, 80, 3), 127, dtype=np.uint8)
         assert cv2.imwrite(str(root / 'sample.jpg'), image)
         keypoints = np.zeros((1, 17, 2), dtype=np.float32)
-        keypoints[0, :2] = ((10, 5), (12, 8))
+        keypoints[0, :2] = ((20, 20), (50, 35))
         confidence = np.zeros((1, 17), dtype=np.float32)
         confidence[0, :2] = (0.9, 0.4)
         annotations_path = root / 'samples.npz'
@@ -258,13 +296,15 @@ def test_offline_precompute_uses_the_same_non_person_contact_selection():
 
         output_dir = root / 'masks'
         output_annotations = root / 'samples_with_masks.npz'
+        predictor = _FakePointPromptPredictor()
+        generator = _FakeContactProposalGenerator()
         count = precompute.precompute_masks(
             annotations_path,
             root,
             output_dir,
             output_annotations,
-            _FakeContactProposalGenerator(),
-            sam_predictor=_FakePointPromptPredictor(),
+            generator,
+            sam_predictor=predictor,
         )
 
         assert count == 1
@@ -272,6 +312,9 @@ def test_offline_precompute_uses_the_same_non_person_contact_selection():
             mask_path = root / str(result['object_mask_path'][0])
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         assert mask is not None
-        assert mask[4:20, 8:24].sum() == 0
-        assert mask[4:20, 24:31].sum() > 0
-        assert mask[48:56, 0:8].sum() == 0
+        assert mask[18:30, 62:74].sum() > 0
+        assert mask[44:56, 45:59].sum() > 0
+        assert mask[10:44, 10:62].sum() == 0
+        assert predictor.set_image_calls == 1
+        assert predictor.predict_calls == 3
+        assert generator.calls == 0

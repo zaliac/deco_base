@@ -46,6 +46,8 @@ hparams.TRAINING.DINO_TEACHER_TEMP = 0.04
 hparams.TRAINING.DINO_STUDENT_TEMP = 0.1
 hparams.TRAINING.DINO_CENTER_MOMENTUM = 0.9
 hparams.TRAINING.DISTILL_RAMP_STEPS = 2000     # warm distill terms 0->1 over this many batches
+hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS = 12.0
+hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS = 8
 
 # Training hparams
 hparams.VALIDATION = CN()

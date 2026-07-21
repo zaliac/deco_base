@@ -1,11 +1,12 @@
-"""Contact-object mask helpers for the SAM-3D-Objects conditioning path.
+"""Object-mask helpers for the SAM-3D-Objects conditioning path.
 
 SAM-3D-Objects uses the alpha channel of an RGBA image as its object mask.  DECO
 keeps RGB and mask tensors separate while loading a dataset, then recreates that
 RGBA contract inside ``SAM3DObjectsEncoder``.  Keeping the crop/resize operations
 here makes it difficult for the two tensors to drift out of pixel alignment. Task 6
-also uses these helpers to remove the keypoint-segmented person and retain only
-automatic-SAM proposals immediately around that person.
+uses an independent circular point prompt around each body keypoint, removes a
+separately predicted human mask, and passes the remaining union through the
+single-alpha encoder path.
 """
 
 from __future__ import annotations
@@ -149,6 +150,60 @@ def keypoints_to_sam_points(
     return point_coords, point_labels
 
 
+def keypoints_to_sam_circle_prompts(
+    keypoints: np.ndarray,
+    keypoint_conf: Optional[np.ndarray],
+    source_size: Sequence[int],
+    *,
+    confidence_threshold: float = 0.3,
+    radius: float = 12.0,
+    num_circle_points: int = 8,
+):
+    """Build one local SAM point prompt for every valid 2D keypoint.
+
+    SAM accepts discrete clicks rather than a circular prompt primitive.  Each
+    requested circle is therefore represented by its center plus evenly-spaced
+    positive clicks on the circle boundary.  The prompts stay separate: callers
+    must invoke ``SamPredictor.predict`` once per circle instead of combining all
+    body keypoints into one person prompt.
+    """
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError('radius must be a positive finite number')
+    if num_circle_points < 3:
+        raise ValueError('num_circle_points must be at least three')
+
+    centers, _ = keypoints_to_sam_points(
+        keypoints,
+        keypoint_conf,
+        source_size,
+        confidence_threshold=confidence_threshold,
+    )
+    if centers is None:
+        return []
+
+    source_h, source_w = int(source_size[0]), int(source_size[1])
+    angles = np.linspace(0.0, 2.0 * np.pi, num_circle_points, endpoint=False)
+    boundary_offsets = np.stack(
+        (radius * np.cos(angles), radius * np.sin(angles)), axis=1
+    ).astype(np.float32)
+    offsets = np.concatenate((np.zeros((1, 2), dtype=np.float32), boundary_offsets), axis=0)
+
+    prompts = []
+    for center in centers:
+        point_coords = center[None, :] + offsets
+        in_image = (
+            (point_coords[:, 0] >= 0)
+            & (point_coords[:, 0] < source_w)
+            & (point_coords[:, 1] >= 0)
+            & (point_coords[:, 1] < source_h)
+        )
+        # The center is known to be valid, so every prompt has at least one point.
+        point_coords = np.ascontiguousarray(point_coords[in_image], dtype=np.float32)
+        point_labels = np.ones(point_coords.shape[0], dtype=np.int32)
+        prompts.append((point_coords, point_labels))
+    return prompts
+
+
 def select_prompted_sam_mask(masks: np.ndarray, scores: Optional[np.ndarray] = None):
     """Return SAM's highest-scoring mask for one prompted prediction."""
     masks = np.asarray(masks)
@@ -175,6 +230,36 @@ def _resize_mask_to_source(mask: np.ndarray, source_size: Sequence[int]) -> np.n
     return binary_object_mask(mask)
 
 
+def union_sam_masks(masks: Iterable[np.ndarray], source_size: Sequence[int]):
+    """Union nonempty SAM masks after aligning them to the source image size."""
+    union = None
+    for mask in masks:
+        if mask is None:
+            continue
+        aligned = _resize_mask_to_source(mask, source_size)
+        if not np.any(aligned):
+            continue
+        union = aligned if union is None else np.logical_or(union > 0, aligned > 0)
+    return None if union is None else binary_object_mask(union)
+
+
+def remove_human_mask(
+    object_mask: Optional[np.ndarray],
+    human_mask: Optional[np.ndarray],
+    source_size: Sequence[int],
+):
+    """Remove a keypoint-prompted human mask from a union of SAM object masks.
+
+    Returning ``None`` when either input is unavailable prevents a body-containing
+    circle mask from silently reaching the SAM-3D-Objects alpha channel.
+    """
+    if object_mask is None or human_mask is None:
+        return None
+    object_mask = _resize_mask_to_source(object_mask, source_size) > 0
+    human_mask = _resize_mask_to_source(human_mask, source_size) > 0
+    return binary_object_mask(np.logical_and(object_mask, ~human_mask))
+
+
 def _iter_sam_annotations(annotations: Any) -> Iterable[tuple[Mapping[str, Any], np.ndarray]]:
     """Yield ``(metadata, segmentation)`` pairs from SAM-style proposals."""
     if annotations is None:
@@ -199,23 +284,6 @@ def _iter_sam_annotations(annotations: Any) -> Iterable[tuple[Mapping[str, Any],
                 yield annotation, np.asarray(segmentation)
         else:
             yield {}, np.asarray(annotation)
-
-
-def _mask_bbox(mask: np.ndarray):
-    """Return an exclusive ``(x0, y0, x1, y1)`` mask bounding box, if nonempty."""
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return None
-    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-
-
-def _boxes_intersect(first, second) -> bool:
-    return (
-        first[0] < second[2]
-        and second[0] < first[2]
-        and first[1] < second[3]
-        and second[1] < first[3]
-    )
 
 
 def _minimum_mask_area(min_area: int, image_area: int) -> int:
@@ -246,9 +314,9 @@ def select_sam_object_mask(
 ):
     """Choose a generic automatic-SAM proposal for legacy/task-4 callers.
 
-    This deliberately does *not* use human keypoints.  New ``sam_sam`` code should
-    use :func:`select_contact_object_mask`, which removes the human region and only
-    retains proposals adjacent to it.
+    This deliberately does *not* use human keypoints.  The active Task-6 path uses
+    :func:`keypoints_to_sam_circle_prompts` instead; this function remains only for
+    legacy callers that request automatic mask generation without keypoints.
     """
     if selection not in {'highest_score', 'largest', 'union'}:
         raise ValueError(f'Unsupported SAM mask selection: {selection}')
@@ -278,133 +346,3 @@ def select_sam_object_mask(
             key=lambda candidate: (_annotation_quality(candidate[0]), candidate[2], -candidate[3]),
         )
     return selected[1]
-
-
-def select_contact_object_mask(
-    annotations: Any,
-    human_mask: np.ndarray,
-    source_size: Optional[Sequence[int]] = None,
-    *,
-    min_area: int = 100,
-    max_area_fraction: float = 0.80,
-    max_human_overlap: float = 0.20,
-    contact_band_ratio: float = 0.08,
-    min_band_px: int = 8,
-    max_band_px: int = 96,
-    max_candidates: int = 3,
-    nms_iou_threshold: float = 0.85,
-):
-    """Select a union of automatic-SAM proposals likely to contact a person.
-
-    The caller first obtains ``human_mask`` from the full set of confident body
-    keypoints.  This function then uses its bounding box as a local search region
-    and an exterior, dilated contact band to retain nearby automatic-SAM proposals.
-    Proposals that substantially overlap the person are rejected and selected masks
-    have all human pixels removed, so the returned mask can safely condition the
-    SAM-3D-Objects alpha branch.
-
-    A union of up to ``max_candidates`` distinct nearby proposals is returned: an
-    image can contain several independently segmented contact objects (for example,
-    a chair and a floor).  ``None`` means no credible non-person proposal was found.
-    """
-    if not 0 <= max_human_overlap < 1:
-        raise ValueError('max_human_overlap must be in [0, 1)')
-    if not 0 < max_area_fraction <= 1:
-        raise ValueError('max_area_fraction must be in (0, 1]')
-    if contact_band_ratio <= 0 or min_band_px < 1 or max_band_px < min_band_px:
-        raise ValueError('Invalid contact-band configuration')
-    if max_candidates < 1:
-        raise ValueError('max_candidates must be at least one')
-
-    if source_size is None:
-        source_size = np.asarray(human_mask).shape[:2]
-    source_h, source_w = int(source_size[0]), int(source_size[1])
-    human_mask = _resize_mask_to_source(human_mask, (source_h, source_w)) > 0
-    human_bbox = _mask_bbox(human_mask)
-    if human_bbox is None:
-        return None
-
-    image_area = source_h * source_w
-    min_area = _minimum_mask_area(min_area, image_area)
-    max_area = max_area_fraction * image_area
-    human_width = human_bbox[2] - human_bbox[0]
-    human_height = human_bbox[3] - human_bbox[1]
-    band_radius = int(round(contact_band_ratio * np.hypot(human_width, human_height)))
-    band_radius = int(np.clip(band_radius, min_band_px, min(max_band_px, max(source_h, source_w))))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * band_radius + 1, 2 * band_radius + 1)
-    )
-    contact_band = cv2.dilate(human_mask.astype(np.uint8), kernel) > 0
-    contact_band &= ~human_mask
-    search_bbox = (
-        max(0, human_bbox[0] - band_radius),
-        max(0, human_bbox[1] - band_radius),
-        min(source_w, human_bbox[2] + band_radius),
-        min(source_h, human_bbox[3] + band_radius),
-    )
-
-    candidates = []
-    for index, (annotation, segmentation) in enumerate(_iter_sam_annotations(annotations)):
-        proposal = _resize_mask_to_source(segmentation, (source_h, source_w)) > 0
-        proposal_area = int(proposal.sum())
-        if proposal_area < min_area or proposal_area > max_area:
-            continue
-
-        human_overlap = int(np.logical_and(proposal, human_mask).sum()) / proposal_area
-        if human_overlap > max_human_overlap:
-            continue
-
-        object_only = np.logical_and(proposal, ~human_mask)
-        object_area = int(object_only.sum())
-        if object_area < min_area:
-            continue
-        object_bbox = _mask_bbox(object_only)
-        if object_bbox is None or not _boxes_intersect(object_bbox, search_bbox):
-            continue
-
-        band_pixels = int(np.logical_and(object_only, contact_band).sum())
-        if band_pixels == 0:
-            continue
-
-        # Favour substantial contact-band support over very large scene regions,
-        # with SAM's predicted IoU/stability only breaking otherwise-close ties.
-        score = (
-            band_pixels / max(np.sqrt(object_area), 1.0)
-            + 0.05 * _annotation_quality(annotation)
-            - 0.10 * (object_area / image_area)
-        )
-        candidates.append({
-            'mask': object_only,
-            'area': object_area,
-            'band_pixels': band_pixels,
-            'quality': _annotation_quality(annotation),
-            'score': score,
-            'index': index,
-        })
-
-    candidates.sort(
-        key=lambda candidate: (
-            -candidate['score'],
-            -candidate['band_pixels'],
-            -candidate['quality'],
-            candidate['area'],
-            candidate['index'],
-        )
-    )
-    selected = []
-    for candidate in candidates:
-        duplicate = False
-        for existing in selected:
-            intersection = int(np.logical_and(candidate['mask'], existing['mask']).sum())
-            union = int(np.logical_or(candidate['mask'], existing['mask']).sum())
-            if union and intersection / union >= nms_iou_threshold:
-                duplicate = True
-                break
-        if not duplicate:
-            selected.append(candidate)
-        if len(selected) == max_candidates:
-            break
-
-    if not selected:
-        return None
-    return binary_object_mask(np.logical_or.reduce([candidate['mask'] for candidate in selected]))

@@ -112,8 +112,8 @@ class TrainStepper():
 
         img_paths = batch['img_path']
         img = batch['img'].to(self.device)
-        # BaseDataset's task-6 nearby-object SAM mask is supplied to the
-        # SAM-3D-Objects semantic branch alongside the RGB image.
+        # BaseDataset's human-removed union of Task-6 keypoint-circle SAM masks
+        # is supplied to the SAM-3D-Objects semantic branch alongside the RGB image.
         object_prompt = batch.get('object_prompt', batch.get('object_mask'))
         if object_prompt is not None:
             object_prompt = object_prompt.to(self.device)

@@ -109,13 +109,18 @@ if __name__ == '__main__':
     dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
 
     use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
+    sam_object_mask_kwargs = {
+        'generate_object_masks': use_sam_object_masks,
+        'sam_keypoint_circle_radius': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS,
+        'sam_keypoint_circle_points': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS,
+    }
     train_dataset = MixedDataset(
         hparams.TRAINING.DATASETS,
         'train',
         dataset_mix_pdf=hparams.TRAINING.DATASET_MIX_PDF,
         dataset_root_path=dataset_root_path,
         normalize=hparams.DATASET.NORMALIZE_IMAGES,
-        generate_object_masks=use_sam_object_masks,
+        **sam_object_mask_kwargs,
     )
 
     val_datasets = []
@@ -124,13 +129,13 @@ if __name__ == '__main__':
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
-                generate_object_masks=use_sam_object_masks,
+                **sam_object_mask_kwargs,
             ))
         elif ds in ['damon']:
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
-                generate_object_masks=use_sam_object_masks,
+                **sam_object_mask_kwargs,
             ))
         else:
             raise ValueError('Dataset not supported')

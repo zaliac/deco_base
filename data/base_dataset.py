@@ -10,11 +10,13 @@ from utils.object_masks import (
     alpha_object_mask,
     binary_object_mask,
     crop_and_resize_object_mask,
+    keypoints_to_sam_circle_prompts,
     keypoints_to_sam_points,
     load_object_mask,
-    select_contact_object_mask,
+    remove_human_mask,
     select_prompted_sam_mask,
     select_sam_object_mask,
+    union_sam_masks,
 )
 
 def mask_split(img, num_parts):
@@ -42,8 +44,8 @@ class BaseDataset(Dataset):
             sam_predictor=None,
             sam_prompt_confidence=0.3,
             sam_multimask_output=True,
-            sam_automatic_mask_kwargs=None,
-            sam_contact_max_candidates=3,
+            sam_keypoint_circle_radius=12.0,
+            sam_keypoint_circle_points=8,
     ):
         self.dataset = dataset
         self.mode = mode
@@ -116,8 +118,9 @@ class BaseDataset(Dataset):
             or Path(__file__).resolve().parents[1]
             / 'data/weights/sam/sam_vit_b_01ec64.pth'
         )
-        # Task 6 uses the predictor for a human mask and an automatic generator for
-        # nearby non-human proposals. Both can share the same underlying SAM model.
+        # Task 6 option 1 runs SAM independently for every keypoint circle, then
+        # subtracts a separate all-keypoint human mask. An explicitly supplied
+        # automatic generator remains a no-keypoint fallback for task-4 callers.
         self._sam_predictor = sam_predictor
         self._sam_mask_generator = sam_mask_generator
         self._has_external_sam_mask_generator = sam_mask_generator is not None
@@ -125,10 +128,12 @@ class BaseDataset(Dataset):
         if not 0.0 <= self.sam_prompt_confidence <= 1.0:
             raise ValueError('sam_prompt_confidence must be in [0, 1]')
         self.sam_multimask_output = bool(sam_multimask_output)
-        self.sam_automatic_mask_kwargs = dict(sam_automatic_mask_kwargs or {})
-        self.sam_contact_max_candidates = int(sam_contact_max_candidates)
-        if self.sam_contact_max_candidates < 1:
-            raise ValueError('sam_contact_max_candidates must be at least one')
+        self.sam_keypoint_circle_radius = float(sam_keypoint_circle_radius)
+        self.sam_keypoint_circle_points = int(sam_keypoint_circle_points)
+        if not np.isfinite(self.sam_keypoint_circle_radius) or self.sam_keypoint_circle_radius <= 0:
+            raise ValueError('sam_keypoint_circle_radius must be a positive finite number')
+        if self.sam_keypoint_circle_points < 3:
+            raise ValueError('sam_keypoint_circle_points must be at least three')
 
         # Optional per-image person-crop bbox [x0,y0,x1,y1] in original-image pixels.
         # Used by datasets whose images are not person-centric (e.g. BEHAVE full
@@ -160,14 +165,14 @@ class BaseDataset(Dataset):
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
 
     def _get_sam_predictor(self):
-        """Lazily obtain a SAM predictor for the keypoint-derived human mask."""
+        """Lazily obtain a SAM predictor for the per-keypoint circle prompts."""
         if self._sam_predictor is not None:
             return self._sam_predictor
         if not self.generate_object_masks:
             return None
 
         # A supplied SamAutomaticMaskGenerator already owns a SAM model. Reuse it
-        # rather than loading a second model just to segment the person.
+        # rather than loading a second model just for the circle prompts.
         generator_predictor = getattr(self._sam_mask_generator, 'predictor', None)
         shared_model = getattr(generator_predictor, 'model', None)
         if shared_model is not None:
@@ -175,7 +180,7 @@ class BaseDataset(Dataset):
                 from segment_anything import SamPredictor
             except ImportError as exc:
                 raise ImportError(
-                    'Task-6 contact-object masks require segment-anything. Install the '
+                    'Task-6 keypoint-circle masks require segment-anything. Install the '
                     'project requirements before training.'
                 ) from exc
             self._sam_predictor = SamPredictor(shared_model)
@@ -187,19 +192,19 @@ class BaseDataset(Dataset):
             return None
         if not self.sam_checkpoint_path.is_file():
             raise FileNotFoundError(
-                'SAM checkpoint required for task-6 contact-object masks was not found: '
+                'SAM checkpoint required for task-6 keypoint-circle masks was not found: '
                 f'{self.sam_checkpoint_path}'
             )
         try:
             from segment_anything import SamPredictor, sam_model_registry
         except ImportError as exc:
             raise ImportError(
-                'Task-6 contact-object masks require segment-anything. Install the '
+                'Task-6 keypoint-circle masks require segment-anything. Install the '
                 'project requirements before training.'
             ) from exc
 
         print(
-            f'Loading SAM human-mask predictor ({self.sam_model_type}) on '
+            f'Loading SAM keypoint-circle predictor ({self.sam_model_type}) on '
             f'{self.sam_device}'
         )
         sam = sam_model_registry[self.sam_model_type](checkpoint=str(self.sam_checkpoint_path))
@@ -208,33 +213,27 @@ class BaseDataset(Dataset):
         self._sam_predictor = SamPredictor(sam)
         return self._sam_predictor
 
-    def _get_sam_mask_generator(self):
-        """Lazily build automatic proposals, sharing the predictor's SAM model."""
-        if self._sam_mask_generator is not None:
-            return self._sam_mask_generator
-        predictor = self._get_sam_predictor()
-        shared_model = getattr(predictor, 'model', None)
-        if shared_model is None:
-            return None
-        try:
-            from segment_anything import SamAutomaticMaskGenerator
-        except ImportError as exc:
-            raise ImportError(
-                'Task-6 contact-object masks require segment-anything. Install the '
-                'project requirements before training.'
-            ) from exc
-        self._sam_mask_generator = SamAutomaticMaskGenerator(
-            shared_model, **self.sam_automatic_mask_kwargs
-        )
-        return self._sam_mask_generator
-
     @staticmethod
     def _select_sam_object_mask(annotations, source_size):
         """Choose a generic automatic-SAM proposal for legacy task-4 callers."""
         return select_sam_object_mask(annotations, source_size)
 
-    def _sam_point_prompt(self, index, source_size):
-        """Return valid COCO keypoints as SAM positive point prompts in image pixels."""
+    def _sam_circle_prompts(self, index, source_size):
+        """Return one independent circular positive-point prompt per valid keypoint."""
+        if self.keypoints_2d is None or not self.has_keypoints[index]:
+            return []
+        confidence = self.keypoint_conf[index] if self.keypoint_conf is not None else None
+        return keypoints_to_sam_circle_prompts(
+            self.keypoints_2d[index],
+            confidence,
+            source_size,
+            confidence_threshold=self.sam_prompt_confidence,
+            radius=self.sam_keypoint_circle_radius,
+            num_circle_points=self.sam_keypoint_circle_points,
+        )
+
+    def _sam_human_prompt(self, index, source_size):
+        """Return one all-keypoint prompt used only to remove the human body."""
         if self.keypoints_2d is None or not self.has_keypoints[index]:
             return None, None
         confidence = self.keypoint_conf[index] if self.keypoint_conf is not None else None
@@ -251,52 +250,49 @@ class BaseDataset(Dataset):
         return select_prompted_sam_mask(masks, scores)
 
     def _generate_object_mask(self, index, image_with_alpha, source_size):
-        """Generate non-person SAM masks around the keypoint-derived body mask."""
-        point_coords, point_labels = self._sam_point_prompt(index, source_size)
-        if point_coords is not None:
+        """Union per-circle SAM masks after removing the keypoint-prompted person."""
+        circle_prompts = self._sam_circle_prompts(index, source_size)
+        human_point_coords, human_point_labels = self._sam_human_prompt(index, source_size)
+        if circle_prompts and human_point_coords is not None:
             predictor = self._get_sam_predictor()
             if predictor is not None:
                 rgb_image = cv2.cvtColor(image_with_alpha[:, :, :3], cv2.COLOR_BGR2RGB)
-                with torch.no_grad():
-                    predictor.set_image(rgb_image)
-                    masks, scores, _ = predictor.predict(
-                        point_coords=point_coords,
-                        point_labels=point_labels,
-                        multimask_output=self.sam_multimask_output,
-                    )
-                human_mask = self._select_prompted_sam_mask(masks, scores)
-                generator = self._get_sam_mask_generator()
-                if human_mask is not None and generator is not None:
-                    # The automatic generator owns another predictor. Free the
-                    # keypoint-predictor embedding before it creates its own image
-                    # features, avoiding two full image embeddings on GPU at once.
+                selected_masks = []
+                human_mask = None
+                try:
+                    with torch.no_grad():
+                        # Encode once, decode a human mask from all keypoint centers,
+                        # then decode one candidate mask per independent circle.
+                        predictor.set_image(rgb_image)
+                        masks, scores, _ = predictor.predict(
+                            point_coords=human_point_coords,
+                            point_labels=human_point_labels,
+                            multimask_output=self.sam_multimask_output,
+                        )
+                        human_mask = self._select_prompted_sam_mask(masks, scores)
+                        if human_mask is not None:
+                            for point_coords, point_labels in circle_prompts:
+                                masks, scores, _ = predictor.predict(
+                                    point_coords=point_coords,
+                                    point_labels=point_labels,
+                                    multimask_output=self.sam_multimask_output,
+                                )
+                                selected_mask = self._select_prompted_sam_mask(masks, scores)
+                                if selected_mask is not None:
+                                    selected_masks.append(selected_mask)
+                finally:
                     reset_image = getattr(predictor, 'reset_image', None)
                     if callable(reset_image):
                         reset_image()
-                    with torch.no_grad():
-                        annotations = (
-                            generator.generate(rgb_image)
-                            if hasattr(generator, 'generate') else generator(rgb_image)
-                        )
-                    return select_contact_object_mask(
-                        annotations,
-                        human_mask,
-                        source_size,
-                        max_candidates=self.sam_contact_max_candidates,
-                    )
+                return remove_human_mask(
+                    union_sam_masks(selected_masks, source_size),
+                    human_mask,
+                    source_size,
+                )
 
-                # Never return the person mask when no automatic object proposal is
-                # available; that was precisely the task-5 failure mode.
-                return None
-
-        # Retain explicit task-4 generator support for code with no keypoints. Normal
-        # sam_sam training does not enter this path: it uses a localized human mask
-        # and returns an empty alpha prompt if no nearby object is credible.
-        if (
-            point_coords is None
-            and self._has_external_sam_mask_generator
-            and self._sam_predictor is None
-        ):
+        # Retain explicit task-4 generator support for samples with no usable
+        # keypoints.  Normal sam_sam training takes the circle-prompt branch above.
+        if not circle_prompts and self._has_external_sam_mask_generator:
             rgb_image = cv2.cvtColor(image_with_alpha[:, :, :3], cv2.COLOR_BGR2RGB)
             with torch.no_grad():
                 annotations = (
@@ -342,7 +338,7 @@ class BaseDataset(Dataset):
                 else np.ones(source_size, dtype=np.float32)
             )
             if self.generate_object_masks:
-                # Cache a failed/no-nearby-object result too: retrying SAM for it on
+                # Cache a failed/no-prompt-mask result too: retrying SAM for it on
                 # every epoch wastes substantial GPU time and cannot improve it.
                 self.object_masks[index] = mask.astype(np.uint8, copy=False)
 
