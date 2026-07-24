@@ -49,6 +49,24 @@ hparams.TRAINING.DISTILL_RAMP_STEPS = 2000     # warm distill terms 0->1 over th
 hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS = 12.0
 hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS = 8
 
+# Per-image, label-free test-time adaptation (Task 7).  Disabled by default so
+# validation remains identical to a checkpoint-only evaluation unless requested.
+hparams.TEST_TIME = CN()
+hparams.TEST_TIME.ENABLED = True
+hparams.TEST_TIME.STEPS = 3
+hparams.TEST_TIME.LR = 1e-5
+hparams.TEST_TIME.GEOMETRY_WEIGHT = 1.0
+hparams.TEST_TIME.OUT_WEIGHT = 0.05
+hparams.TEST_TIME.DINO_WEIGHT = 0.01
+hparams.TEST_TIME.DINO_OUT_DIM = 256
+hparams.TEST_TIME.EMA_MOMENTUM = 0.996
+hparams.TEST_TIME.INTERFACE_RADIUS = 8
+hparams.TEST_TIME.CONFIDENCE_THRESHOLD = 0.70
+hparams.TEST_TIME.POSITIVE_WEIGHT = 0.10       # reliable supported-contact pseudo-label BCE
+hparams.TEST_TIME.TOPOLOGY_WEIGHT = 0.02       # mesh-local patch completion within interface band
+hparams.TEST_TIME.POSITIVE_THRESHOLD = 0.45    # teacher confidence allowed to seed supported positives
+hparams.TEST_TIME.STABILITY_TEMPERATURE = 0.10 # lower = require closer teacher/student agreement
+
 # Training hparams
 hparams.VALIDATION = CN()
 hparams.VALIDATION.SUMMARY_STEPS = 100

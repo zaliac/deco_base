@@ -3,7 +3,7 @@ PROJECT_NAME: 'DECO_demo_training'
 OUTPUT_DIR: 'deco_results'
 CONDOR_DIR: ''
 DATASET:
-  BATCH_SIZE: 4    # 4
+  BATCH_SIZE: 2    # 4
   NUM_WORKERS: 8
   NORMALIZE_IMAGES: [True]
 OPTIMIZER:
@@ -11,7 +11,7 @@ OPTIMIZER:
   LR: [1e-5]
   NUM_UPDATE_LR: 3
 TRAINING:
-  ENCODER: 'sam_hrnet'    # 'hrnet'
+  ENCODER: 'sam_sam'    # 'hrnet', 'sam_hrnet', 'sam_sam'
   CONTEXT: [True]
   NUM_EPOCHS: 60  # 30
   NUM_EARLY_STOP: 10
@@ -20,7 +20,7 @@ TRAINING:
   DATASETS: ['damon']
   DATASET_MIX_PDF: ['1.0'] # should sum to 1.0 unless you want to weight by dataset size
   DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'    # ''
-  BEST_MODEL_PATH: './checkpoints/deco_best.pth'
+  BEST_MODEL_PATH: './checkpoints/demo_train_best.pth'
   LOSS_WEIGHTS: 1.
   PAL_LOSS_WEIGHTS: 0.0   # 0.01
   DISTILL: True

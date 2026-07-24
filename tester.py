@@ -17,6 +17,27 @@ def test(hparams):
 
     logger.info(f'Loading weights from {hparams.TRAINING.BEST_MODEL_PATH}')
     _, _ = solver.load(hparams.TRAINING.BEST_MODEL_PATH)
+    if hparams.TEST_TIME.ENABLED:
+        solver.enable_test_time_adaptation(
+            steps=hparams.TEST_TIME.STEPS,
+            learning_rate=hparams.TEST_TIME.LR,
+            geometry_weight=hparams.TEST_TIME.GEOMETRY_WEIGHT,
+            out_weight=hparams.TEST_TIME.OUT_WEIGHT,
+            dino_weight=hparams.TEST_TIME.DINO_WEIGHT,
+            dino_out_dim=hparams.TEST_TIME.DINO_OUT_DIM,
+            ema_momentum=hparams.TEST_TIME.EMA_MOMENTUM,
+            interface_radius=hparams.TEST_TIME.INTERFACE_RADIUS,
+            confidence_threshold=hparams.TEST_TIME.CONFIDENCE_THRESHOLD,
+            positive_weight=hparams.TEST_TIME.POSITIVE_WEIGHT,
+            topology_weight=hparams.TEST_TIME.TOPOLOGY_WEIGHT,
+            positive_threshold=hparams.TEST_TIME.POSITIVE_THRESHOLD,
+            stability_temperature=hparams.TEST_TIME.STABILITY_TEMPERATURE,
+        )
+        logger.info(
+            f'Task-7 TTA enabled: {hparams.TEST_TIME.STEPS} steps/image, '
+            f'geometry weight {hparams.TEST_TIME.GEOMETRY_WEIGHT:g}, '
+            f'output-consistency weight {hparams.TEST_TIME.OUT_WEIGHT:g}'
+        )
     
     # Run testing
     for test_loader in val_loaders:
@@ -35,6 +56,9 @@ def test(hparams):
         print('\nTime taken per image for evaluation: ', total_time)
         print('-'*50)
 
+    if solver.test_time_adapter is not None:
+        solver.test_time_adapter.close()
+
 if __name__ == '__main__':
     args = parse_args()
     hparams = run_grid_search_experiments(
@@ -49,7 +73,12 @@ if __name__ == '__main__':
         device = torch.device('cpu')
 
     val_datasets = []
-    use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
+    # Task 7 uses the same label-free, keypoint-conditioned SAM object proposal
+    # as the sam_sam semantic encoder.  Generate it for TTA even when the
+    # checkpoint itself uses sam_hrnet.
+    use_sam_object_masks = (
+        hparams.TRAINING.ENCODER == 'sam_sam' or hparams.TEST_TIME.ENABLED
+    )
     dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
     sam_object_mask_kwargs = {
         'generate_object_masks': use_sam_object_masks,
