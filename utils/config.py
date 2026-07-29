@@ -91,7 +91,13 @@ def get_grid_search_configs(config, excluded_keys=[]):
     for k,v in flattened_config_dict.items():
         if isinstance(v,list):
             if k in excluded_keys:
-                flattened_config_dict[k] = ['+'.join(v)]
+                # Dataset lists use the historical ``+`` representation, but
+                # some excluded values (for example TEST_TIME/ZOOM_SCALES)
+                # are genuine numeric lists that must remain a single config
+                # value rather than becoming a grid-search axis.
+                flattened_config_dict[k] = (
+                    ['+'.join(v)] if all(isinstance(item, str) for item in v) else [v]
+                )
             elif len(v) > 1:
                 hyper_params += [k]
 
@@ -109,7 +115,8 @@ def get_grid_search_configs(config, excluded_keys=[]):
 
     for exp_id, exp in enumerate(experiments):
         for param in excluded_keys:
-            exp[param] = exp[param].strip().split('+')
+            if isinstance(exp[param], str):
+                exp[param] = exp[param].strip().split('+')
         for param_name, param_value in exp.items():
             # print(param_name,type(param_value))
             if isinstance(param_value, list) and (param_value[0] in ['True', 'False']):
@@ -142,7 +149,10 @@ def run_grid_search_experiments(
     # Also return the names of tuned hyperparameters hyperparameters
     different_configs, hyperparams = get_grid_search_configs(
         cfg,
-        excluded_keys=['TRAINING/DATASETS', 'TRAINING/DATASET_MIX_PDF', 'VALIDATION/DATASETS'],
+        excluded_keys=[
+            'TRAINING/DATASETS', 'TRAINING/DATASET_MIX_PDF',
+            'VALIDATION/DATASETS', 'TEST_TIME/ZOOM_SCALES',
+        ],
     )
     logger.info(f'Grid search hparams: \n {hyperparams}')
 

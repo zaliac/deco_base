@@ -1,3 +1,24 @@
+# import os
+# import sys
+#
+# print("================ DEBUG ================")
+# print("Python executable:")
+# print(sys.executable)
+#
+# print("\nCurrent directory:")
+# print(os.getcwd())
+#
+# print("\nsys.path:")
+# for p in sys.path:
+#     print(p)
+#
+# print("\nImport data:")
+# import data
+# print(data.__path__)
+#
+# print("========================================")
+
+
 import torch
 from torch.utils.data import DataLoader
 from loguru import logger
@@ -21,22 +42,15 @@ def test(hparams):
         solver.enable_test_time_adaptation(
             steps=hparams.TEST_TIME.STEPS,
             learning_rate=hparams.TEST_TIME.LR,
-            geometry_weight=hparams.TEST_TIME.GEOMETRY_WEIGHT,
-            out_weight=hparams.TEST_TIME.OUT_WEIGHT,
-            dino_weight=hparams.TEST_TIME.DINO_WEIGHT,
-            dino_out_dim=hparams.TEST_TIME.DINO_OUT_DIM,
+            zoom_scales=hparams.TEST_TIME.ZOOM_SCALES,
+            consistency_weight=hparams.TEST_TIME.CONSISTENCY_WEIGHT,
+            ensemble_original_weight=hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT,
             ema_momentum=hparams.TEST_TIME.EMA_MOMENTUM,
-            interface_radius=hparams.TEST_TIME.INTERFACE_RADIUS,
-            confidence_threshold=hparams.TEST_TIME.CONFIDENCE_THRESHOLD,
-            positive_weight=hparams.TEST_TIME.POSITIVE_WEIGHT,
-            topology_weight=hparams.TEST_TIME.TOPOLOGY_WEIGHT,
-            positive_threshold=hparams.TEST_TIME.POSITIVE_THRESHOLD,
-            stability_temperature=hparams.TEST_TIME.STABILITY_TEMPERATURE,
         )
         logger.info(
-            f'Task-7 TTA enabled: {hparams.TEST_TIME.STEPS} steps/image, '
-            f'geometry weight {hparams.TEST_TIME.GEOMETRY_WEIGHT:g}, '
-            f'output-consistency weight {hparams.TEST_TIME.OUT_WEIGHT:g}'
+            f'Task-7 scale TTA enabled: {hparams.TEST_TIME.STEPS} steps/image, '
+            f'zooms {list(hparams.TEST_TIME.ZOOM_SCALES)}, '
+            f'consistency weight {hparams.TEST_TIME.CONSISTENCY_WEIGHT:g}'
         )
     
     # Run testing
@@ -73,12 +87,9 @@ if __name__ == '__main__':
         device = torch.device('cpu')
 
     val_datasets = []
-    # Task 7 uses the same label-free, keypoint-conditioned SAM object proposal
-    # as the sam_sam semantic encoder.  Generate it for TTA even when the
-    # checkpoint itself uses sam_hrnet.
-    use_sam_object_masks = (
-        hparams.TRAINING.ENCODER == 'sam_sam' or hparams.TEST_TIME.ENABLED
-    )
+    # Scale TTA is image-only.  Object proposals are required only by the
+    # sam_sam semantic encoder, not by the test-time objective itself.
+    use_sam_object_masks = hparams.TRAINING.ENCODER == 'sam_sam'
     dataset_root_path = hparams.TRAINING.DATASET_ROOT_PATH
     sam_object_mask_kwargs = {
         'generate_object_masks': use_sam_object_masks,

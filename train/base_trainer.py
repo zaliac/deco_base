@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import warnings
 from utils.metrics import metric, precision_recall_f1score, det_error_metric
 import torch
 import numpy as np
@@ -51,6 +52,9 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
     total_time = 0
 
     rend_images = []
+    # Mesh previews are only consumed by TensorBoard.  In standalone testing
+    # there is no writer, so avoid creating an EGL context at all.
+    render_available = writer is not None
 
     eval_dict = {}
 
@@ -110,10 +114,24 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
         total_time += time_taken
 
         # logging every summary_steps steps
-        if step % hparams.VALIDATION.SUMMARY_STEPS == 0:
-            if hparams.TRAINING.CONTEXT:
-                rend = gen_render(output, normalize)
-                rend_images.append(rend)
+        if (
+            render_available
+            and hparams.TRAINING.CONTEXT
+            and step % hparams.VALIDATION.SUMMARY_STEPS == 0
+        ):
+            try:
+                rend_images.append(gen_render(output, normalize))
+            except Exception as error:
+                # pyrender needs a functioning EGL/GL context.  Treat a
+                # rendering failure as a disabled summary feature rather than
+                # discarding an otherwise valid evaluation run.
+                render_available = False
+                warnings.warn(
+                    'Disabling validation mesh previews because offscreen '
+                    f'rendering failed: {error}',
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     eval_dict['cont_precision'] = np.sum(val_epoch_cont_pre) / dataset_size
     eval_dict['cont_recall'] = np.sum(val_epoch_cont_rec) / dataset_size

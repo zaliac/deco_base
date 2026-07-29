@@ -5,7 +5,7 @@ import os
 import time
 from utils.distill import (
     build_teacher, ema_update, two_views, DINOHead, DINOLoss, FeatureGrabber,
-    TestTimeDINOAdapter,
+    TestTimeScalingAdapter,
 )
 
 
@@ -70,116 +70,10 @@ class TrainStepper():
         self.test_time_adapter = None
 
     def enable_test_time_adaptation(self, **kwargs):
-        """Enable Task-7 per-image adaptation after loading the checkpoint.
-
-        The adapter snapshots only fusion/contact-head tensors, freezes all
-        encoders, and rolls changes back after every inference batch.
-        """
+        """Enable Task-7 per-image zoom-and-refine adaptation."""
         if self.test_time_adapter is not None:
             self.test_time_adapter.close()
-        self.test_time_adapter = TestTimeDINOAdapter(self.model, self.device, **kwargs)
-
-    def _tta_smpl_mesh_edges(self, num_vertices):
-        """Return cached undirected SMPL adjacency for reliable TTA patch filling."""
-        if num_vertices != self.pixel_anchoring_loss_smpl.n_vertices:
-            return None
-        if not hasattr(self, '_cached_tta_smpl_edges'):
-            faces = self.pixel_anchoring_loss_smpl.body_faces.to(
-                device=self.device, dtype=torch.long,
-            )
-            edges = torch.cat((
-                faces[:, (0, 1)], faces[:, (1, 2)], faces[:, (2, 0)],
-            ), dim=0)
-            self._cached_tta_smpl_edges = torch.unique(
-                torch.sort(edges, dim=1).values, dim=0,
-            ).transpose(0, 1).contiguous()
-        return self._cached_tta_smpl_edges
-
-    @torch.no_grad()
-    def _tta_geometry(self, pose, betas, transl, has_smpl, is_smplx, cam_k,
-                      img_scale_factor, object_prompt, has_object_mask, num_vertices):
-        """Build Task-7 mesh projections for SMPL samples in the current batch.
-
-        Camera/SMPL fitting is supplied by the dataset.  We deliberately use
-        only the binary SAM object proposal as supervision, never the contact
-        annotation or its 2-D polygon.  SMPL-X samples are skipped because the
-        contact head is indexed on SMPL's 6,890 vertices; mapping their
-        visibility back through the sparse SMPL-to-SMPL-X conversion would make
-        a noisy pseudo-target.  Their photometric TTA losses still apply.
-        """
-        if object_prompt is None:
-            return None
-        B = pose.shape[0]
-        mask = object_prompt
-        if mask.ndim == 3:
-            mask = mask.unsqueeze(1)
-        if mask.ndim != 4 or mask.shape[0] != B:
-            return None
-        projected = torch.zeros(B, num_vertices, 2, device=self.device, dtype=pose.dtype)
-        visible = torch.zeros(B, num_vertices, device=self.device, dtype=pose.dtype)
-        smpl_indices = ((is_smplx == 0) & (has_smpl > 0)).nonzero(as_tuple=False).flatten()
-        if smpl_indices.numel() == 0:
-            return {
-                'projected_vertices': projected,
-                'visible_vertices': visible,
-                'object_mask': mask,
-                'mesh_edges': self._tta_smpl_mesh_edges(num_vertices),
-            }
-
-        params = {
-            'pose': pose[smpl_indices], 'betas': betas[smpl_indices],
-            'transl': transl[smpl_indices], 'has_smpl': has_smpl[smpl_indices],
-        }
-        vertices, _ = self.pixel_anchoring_loss_smpl.get_posed_mesh(params)
-        V = min(vertices.shape[1], num_vertices)
-        z = vertices[..., 2].clamp_min(1e-6)
-        # Dataset preprocessing resizes every person crop to 256x256 and passes
-        # the corresponding x/y scale factors.  This mirrors pixel anchoring's
-        # camera scaling convention.
-        sx, sy = img_scale_factor[smpl_indices, 0], img_scale_factor[smpl_indices, 1]
-        fx = cam_k[smpl_indices, 0, 0] * sx
-        fy = cam_k[smpl_indices, 1, 1] * sy
-        cx = cam_k[smpl_indices, 0, 2] * sx
-        cy = cam_k[smpl_indices, 1, 2] * sy
-        uv = torch.stack((
-            vertices[..., 0] / z * fx[:, None] + cx[:, None],
-            vertices[..., 1] / z * fy[:, None] + cy[:, None],
-        ), dim=-1).to(dtype=projected.dtype)
-        H, W = mask.shape[-2:]
-        in_frame = (
-            (vertices[..., 2] > 1e-6)
-            & (uv[..., 0] >= 0) & (uv[..., 0] <= W - 1)
-            & (uv[..., 1] >= 0) & (uv[..., 1] <= H - 1)
-        )
-        # Lightweight vertex z-buffer: retain only vertices at the nearest
-        # depth for their projected pixel.  It removes most back-side/self-
-        # occluded vertices without invoking a second full mesh renderer during
-        # every TTA step.  (The objective itself remains differentiable only
-        # with respect to contact probabilities, not this fixed geometry.)
-        pixel_x = uv[..., 0].round().long().clamp(0, W - 1)
-        pixel_y = uv[..., 1].round().long().clamp(0, H - 1)
-        pixel_index = pixel_y * W + pixel_x
-        inf = torch.full_like(vertices[..., 2], float('inf'))
-        depth_values = torch.where(in_frame, vertices[..., 2], inf)
-        nearest_depth = torch.full(
-            (vertices.shape[0], H * W), float('inf'),
-            device=vertices.device, dtype=vertices.dtype,
-        )
-        nearest_depth.scatter_reduce_(
-            1, pixel_index, depth_values, reduce='amin', include_self=True,
-        )
-        frontmost = vertices[..., 2] <= nearest_depth.gather(1, pixel_index) + 1e-4
-        in_frame = in_frame & frontmost
-        projected[smpl_indices, :V] = uv[:, :V]
-        visible[smpl_indices, :V] = in_frame[:, :V].to(visible.dtype)
-        if has_object_mask is not None:
-            visible = visible * has_object_mask.to(self.device, visible.dtype).view(B, 1)
-        return {
-            'projected_vertices': projected,
-            'visible_vertices': visible,
-            'object_mask': mask,
-            'mesh_edges': self._tta_smpl_mesh_edges(num_vertices),
-        }
+        self.test_time_adapter = TestTimeScalingAdapter(self.model, self.device, **kwargs)
 
     def enable_distill(self, out_dim=4096, dino_weight=0.0, out_weight=1.0, ema_momentum=0.996,
                        teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000):
@@ -437,19 +331,11 @@ class TrainStepper():
         initial_time = time.time()
         if self.test_time_adapter is not None:
             # ``evaluate`` is intentionally no-grad for ordinary validation;
-            # Task-7 opens a narrow autograd scope only around cross_att/classif.
-            # The geometry dictionary is derived from fitted SMPL + camera and
-            # the label-free Task-6 SAM proposal, never contact annotations.
-            geometry = self._tta_geometry(
-                pose, betas, transl, has_smpl, is_smplx, cam_k,
-                img_scale_factor, object_prompt,
-                batch.get('has_object_mask'),
-                getattr(self.model.classif, 'num_vertices', 6890),
-            )
+            # Task-7 opens a narrow autograd scope only around cross_att/classif
+            # and uses centred zooms of this image as its label-free task.
             with torch.enable_grad():
                 cont, tta_stats = self.test_time_adapter.adapt_and_predict(
                     img, keypoints=keypoints, object_prompt=object_prompt,
-                    geometry=geometry,
                 )
             # TTA only changes the contact prediction.  Context outputs are
             # evaluated once from the restored checkpoint and remain comparable
