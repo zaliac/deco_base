@@ -9,7 +9,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.distill import (
-    TestTimeScalingAdapter, zoom_in_view, zoom_keypoints,
+    TestTimeScalingAdapter, prompt_focus_centers, training_zoom_view, zoom_in_view, zoom_keypoints,
 )
 
 
@@ -86,3 +86,57 @@ def test_zoom_in_keeps_shape_and_remaps_keypoint_prompts():
     assert torch.allclose(transformed[0, 0, :2], torch.tensor([0.0, 0.5]))
     assert transformed[0, 0, 2].item() == 3.0
     assert transformed[0, 1, 2].item() == -2.0
+
+
+def test_training_zoom_rejects_lost_keypoints_per_sample():
+    image = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).view(2, 3, 8, 8)
+    keypoints = torch.tensor([
+        [[0.50, 0.50, 3.0], [0.00, 0.50, 4.0]],  # second point leaves a 1.15x crop
+        [[0.50, 0.50, 3.0], [0.60, 0.50, 4.0]],
+    ])
+
+    zoom = training_zoom_view(
+        image, keypoints=keypoints, min_scale=1.15, max_scale=1.15,
+        probability=1.0, min_keypoint_retention=0.75, focus_prompts=False,
+    )
+
+    assert zoom['applied'].tolist() == [False, True]
+    assert torch.equal(zoom['image'][0], image[0])
+    assert torch.equal(zoom['keypoints'][0], keypoints[0])
+    assert not torch.equal(zoom['image'][1], image[1])
+
+
+def test_training_zoom_rejects_object_prompt_outside_crop():
+    image = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).view(2, 3, 8, 8)
+    object_prompt = torch.zeros(2, 1, 8, 8)
+    object_prompt[0, 0, 0, 0] = 1.0             # outside the centred crop
+    object_prompt[1, 0, 4, 4] = 1.0             # retained by the centred crop
+
+    zoom = training_zoom_view(
+        image, object_prompt=object_prompt, min_scale=1.15, max_scale=1.15,
+        probability=1.0, min_object_retention=0.8, focus_prompts=False,
+    )
+
+    assert zoom['applied'].tolist() == [False, True]
+    assert torch.equal(zoom['object_prompt'][0], object_prompt[0])
+    assert zoom['object_retention'][0].item() == 0.0
+    assert zoom['object_retention'][1].item() == 1.0
+
+
+def test_prompt_focused_zoom_keeps_off_centre_body_evidence_in_crop():
+    image = torch.arange(3 * 8 * 8, dtype=torch.float32).view(1, 3, 8, 8)
+    keypoints = torch.tensor([[[0.97, 0.50, 3.0]]])
+
+    center = prompt_focus_centers(keypoints, batch_size=1, device=image.device, dtype=image.dtype)
+    focused = training_zoom_view(
+        image, keypoints=keypoints, min_scale=1.15, max_scale=1.15,
+        probability=1.0, min_keypoint_retention=1.0, focus_prompts=True,
+    )
+    centred = training_zoom_view(
+        image, keypoints=keypoints, min_scale=1.15, max_scale=1.15,
+        probability=1.0, min_keypoint_retention=1.0, focus_prompts=False,
+    )
+
+    assert torch.allclose(center, torch.tensor([[0.97, 0.50]]))
+    assert focused['applied'].item() is True
+    assert centred['applied'].item() is False

@@ -46,11 +46,13 @@ def test(hparams):
             consistency_weight=hparams.TEST_TIME.CONSISTENCY_WEIGHT,
             ensemble_original_weight=hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT,
             ema_momentum=hparams.TEST_TIME.EMA_MOMENTUM,
+            focus_prompts=hparams.TEST_TIME.FOCUS_PROMPTS,
         )
         logger.info(
             f'Task-7 scale TTA enabled: {hparams.TEST_TIME.STEPS} steps/image, '
             f'zooms {list(hparams.TEST_TIME.ZOOM_SCALES)}, '
-            f'consistency weight {hparams.TEST_TIME.CONSISTENCY_WEIGHT:g}'
+            f'consistency weight {hparams.TEST_TIME.CONSISTENCY_WEIGHT:g}, '
+            f'prompt focus {hparams.TEST_TIME.FOCUS_PROMPTS}'
         )
     
     # Run testing

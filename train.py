@@ -45,7 +45,15 @@ def train(hparams):
                               teacher_temp=hparams.TRAINING.DINO_TEACHER_TEMP,
                               student_temp=hparams.TRAINING.DINO_STUDENT_TEMP,
                               center_momentum=hparams.TRAINING.DINO_CENTER_MOMENTUM,
-                              ramp_steps=hparams.TRAINING.DISTILL_RAMP_STEPS)
+                              ramp_steps=hparams.TRAINING.DISTILL_RAMP_STEPS,
+                              scale_aug_enabled=hparams.TRAINING.DISTILL_SCALE_AUG_ENABLED,
+                              scale_aug_probability=hparams.TRAINING.DISTILL_SCALE_AUG_PROBABILITY,
+                              scale_aug_min=hparams.TRAINING.DISTILL_SCALE_AUG_MIN,
+                              scale_aug_max=hparams.TRAINING.DISTILL_SCALE_AUG_MAX,
+                              scale_consistency_weight=hparams.TRAINING.DISTILL_SCALE_CONSISTENCY_WEIGHT,
+                              scale_aug_min_keypoint_retention=hparams.TRAINING.DISTILL_SCALE_AUG_MIN_KEYPOINT_RETENTION,
+                              scale_aug_min_object_retention=hparams.TRAINING.DISTILL_SCALE_AUG_MIN_OBJECT_RETENTION,
+                              scale_aug_focus_prompts=hparams.TRAINING.DISTILL_SCALE_AUG_FOCUS_PROMPTS)
 
     for epoch in range(start_ep+1, hparams.TRAINING.NUM_EPOCHS + 1):
         # Train one epoch

@@ -5,7 +5,7 @@ import os
 import time
 from utils.distill import (
     build_teacher, ema_update, two_views, DINOHead, DINOLoss, FeatureGrabber,
-    TestTimeScalingAdapter,
+    TestTimeScalingAdapter, training_zoom_view, zoom_in_view,
 )
 
 
@@ -76,7 +76,13 @@ class TrainStepper():
         self.test_time_adapter = TestTimeScalingAdapter(self.model, self.device, **kwargs)
 
     def enable_distill(self, out_dim=4096, dino_weight=0.0, out_weight=1.0, ema_momentum=0.996,
-                       teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000):
+                       teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000,
+                       scale_aug_enabled=False, scale_aug_probability=0.5,
+                       scale_aug_min=1.02, scale_aug_max=1.15,
+                       scale_consistency_weight=0.25,
+                       scale_aug_min_keypoint_retention=0.8,
+                       scale_aug_min_object_retention=0.8,
+                       scale_aug_focus_prompts=True):
         """DINO teacher-student self-distillation (no labels) on the contact path (utils/distill.py).
 
         Builds an EMA teacher that SHARES frozen SAM backbones, a student+teacher DINO head on
@@ -91,6 +97,14 @@ class TrainStepper():
         self.out_weight = out_weight
         self.distill_ramp_steps = ramp_steps
         self._distill_step = 0
+        self.scale_aug_enabled = bool(scale_aug_enabled)
+        self.scale_aug_probability = float(scale_aug_probability)
+        self.scale_aug_min = float(scale_aug_min)
+        self.scale_aug_max = float(scale_aug_max)
+        self.scale_consistency_weight = float(scale_consistency_weight)
+        self.scale_aug_min_keypoint_retention = float(scale_aug_min_keypoint_retention)
+        self.scale_aug_min_object_retention = float(scale_aug_min_object_retention)
+        self.scale_aug_focus_prompts = bool(scale_aug_focus_prompts)
         self.img_mean = torch.tensor(constants.IMG_NORM_MEAN, device=self.device).view(1, 3, 1, 1)
         self.img_std = torch.tensor(constants.IMG_NORM_STD, device=self.device).view(1, 3, 1, 1)
         mp = getattr(self.model.classif, 'mem_proj', None)
@@ -116,6 +130,11 @@ class TrainStepper():
         self.optimizer_contact.add_param_group({'params': list(self.student_dino_head.parameters())})
         print(f'✓ DINO distillation ON: out_dim={out_dim}, dino_w={dino_weight}, out_w={out_weight}, '
               f'ema={ema_momentum}, ramp={ramp_steps}, feat_dim={feat_dim}')
+        if self.scale_aug_enabled:
+            print(f'✓ Task-8 scale augmentation ON: p={self.scale_aug_probability:g}, '
+                  f'scales=[{self.scale_aug_min:g}, {self.scale_aug_max:g}], '
+                  f'consistency_w={self.scale_consistency_weight:g}, '
+                  f'focus_prompts={self.scale_aug_focus_prompts}')
 
     def optimize(self, batch):
         self.model.train()
@@ -162,16 +181,47 @@ class TrainStepper():
         # student trains on the MILD view (supervised + distilled); the EMA teacher sees the
         # WEAK view and provides the label-free targets.
         student_img, teacher_img = img, None
+        student_keypoints, student_object_prompt = keypoints, object_prompt
+        scale_aug = None
         if getattr(self, 'distill', False):
             teacher_img, student_img = two_views(img, self.img_mean, self.img_std)
+            if self.scale_aug_enabled:
+                scale_aug = training_zoom_view(
+                    student_img,
+                    keypoints=keypoints,
+                    object_prompt=object_prompt,
+                    min_scale=self.scale_aug_min,
+                    max_scale=self.scale_aug_max,
+                    probability=self.scale_aug_probability,
+                    min_keypoint_retention=self.scale_aug_min_keypoint_retention,
+                    min_object_retention=self.scale_aug_min_object_retention,
+                    focus_prompts=self.scale_aug_focus_prompts,
+                )
+                student_img = scale_aug['image']
+                student_keypoints = scale_aug['keypoints']
+                student_object_prompt = scale_aug['object_prompt']
+
+                # Context targets are image-plane labels, so transform them with
+                # the same accepted zoom.  Contact labels are mesh labels and
+                # deliberately remain unchanged.
+                if self.context:
+                    applied = scale_aug['applied'][:, None, None, None]
+                    sem_zoom = zoom_in_view(
+                        sem_mask_gt, scale_aug['scales'], mode='nearest', center=scale_aug['centers'],
+                    )
+                    part_zoom = zoom_in_view(
+                        part_mask_gt, scale_aug['scales'], mode='nearest', center=scale_aug['centers'],
+                    )
+                    sem_mask_gt = torch.where(applied, sem_zoom, sem_mask_gt)
+                    part_mask_gt = torch.where(applied, part_zoom, part_mask_gt)
 
         # Forward pass
         if self.context:
             cont, sem_mask_pred, part_mask_pred = self.model(
-                student_img, keypoints=keypoints, object_prompt=object_prompt
+                student_img, keypoints=student_keypoints, object_prompt=student_object_prompt
             )
         else:
-            cont = self.model(student_img, keypoints=keypoints, object_prompt=object_prompt)
+            cont = self.model(student_img, keypoints=student_keypoints, object_prompt=student_object_prompt)
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
@@ -180,21 +230,23 @@ class TrainStepper():
         loss_cont = self.class_loss(gt_contact_labels_3d, cont, valid_contact_3d)
         valid_polygon_contact_2d = has_polygon_contact_2d
 
-        if self.pal_loss_weight > 0 and (is_smplx == 0).sum() > 0:
-            smpl_body_params = {'pose': pose[is_smplx == 0], 'betas': betas[is_smplx == 0],
-                                'transl': transl[is_smplx == 0],
-                                'has_smpl': has_smpl[is_smplx == 0]}
-            loss_pix_anchoring_smpl, contact_2d_pred_rgb_smpl, _ = self.pixel_anchoring_loss_smpl(cont[is_smplx == 0],
+        # Pixel anchoring is defined in original crop coordinates.  Exclude
+        # only accepted zoom samples; they still receive 3D contact labels.
+        pal_samples = is_smplx == 0
+        if scale_aug is not None:
+            pal_samples = pal_samples & ~scale_aug['applied']
+        if self.pal_loss_weight > 0 and pal_samples.sum() > 0:
+            smpl_body_params = {'pose': pose[pal_samples], 'betas': betas[pal_samples],
+                                'transl': transl[pal_samples],
+                                'has_smpl': has_smpl[pal_samples]}
+            loss_pix_anchoring_smpl, contact_2d_pred_rgb_smpl, _ = self.pixel_anchoring_loss_smpl(cont[pal_samples],
                                                                                                   smpl_body_params,
-                                                                                                  cam_k[is_smplx == 0],
-                                                                                                  img_scale_factor[
-                                                                                                      is_smplx == 0],
-                                                                                                  polygon_contact_2d[
-                                                                                                      is_smplx == 0],
-                                                                                                  valid_polygon_contact_2d[
-                                                                                                      is_smplx == 0])
+                                                                                                  cam_k[pal_samples],
+                                                                                                  img_scale_factor[pal_samples],
+                                                                                                  polygon_contact_2d[pal_samples],
+                                                                                                  valid_polygon_contact_2d[pal_samples])
             # weigh the smpl loss based on the number of smpl sample
-            loss_pix_anchoring = loss_pix_anchoring_smpl * (is_smplx == 0).sum() / len(is_smplx)
+            loss_pix_anchoring = loss_pix_anchoring_smpl * pal_samples.sum() / len(is_smplx)
             contact_2d_pred_rgb = contact_2d_pred_rgb_smpl
         else:
             loss_pix_anchoring = 0
@@ -205,7 +257,7 @@ class TrainStepper():
 
         # DINO teacher-student distillation (label-free), ramped up from 0 so the early lagging
         # teacher doesn't drag the student. Teacher runs the WEAK view under no_grad.
-        loss_out = loss_dino = None
+        loss_out = loss_dino = loss_scale = None
         if getattr(self, 'distill', False):
             ramp = min(1.0, self._distill_step / max(self.distill_ramp_steps, 1))
             self._distill_step += 1
@@ -216,8 +268,21 @@ class TrainStepper():
                 )
                 teacher_cont = t_out[0] if isinstance(t_out, (tuple, list)) else t_out
                 teacher_logits = self.teacher_dino_head(self.teacher_feat.feat) if self.dino_weight > 0 else None
-            loss_out = ((cont - teacher_cont) ** 2).mean()         # on-task: output (contact-prob) consistency
-            loss = loss + ramp * self.out_weight * loss_out
+            per_sample_mse = (cont - teacher_cont).square().mean(dim=1)
+            if scale_aug is None:
+                loss_out = per_sample_mse.mean()                   # photometric output consistency
+                loss = loss + ramp * self.out_weight * loss_out
+            else:
+                # Keep the original DINO output objective on non-zoom samples,
+                # and apply a separately modest weight to accepted zooms.
+                unzoomed = ~scale_aug['applied']
+                if unzoomed.any():
+                    loss_out = per_sample_mse[unzoomed].mean()
+                    loss = loss + ramp * self.out_weight * loss_out
+            if scale_aug is not None and scale_aug['applied'].any():
+                applied = scale_aug['applied'].to(per_sample_mse.dtype)
+                loss_scale = (per_sample_mse * applied).sum() / applied.sum()
+                loss = loss + ramp * self.scale_consistency_weight * loss_scale
             if self.dino_weight > 0:                               # the named DINO method: feature self-distillation
                 loss_dino = self.dino_loss(self.student_dino_head(student_feat), teacher_logits)
                 loss = loss + ramp * self.dino_weight * loss_dino
@@ -257,10 +322,16 @@ class TrainStepper():
                     'pal_loss': loss_pix_anchoring,
                     'total_loss': loss}
 
-        if loss_out is not None:                       # DINO distillation diagnostics (for logging)
-            losses['out_loss'] = loss_out
+        if getattr(self, 'distill', False):            # DINO / Task-8 diagnostics
+            if loss_out is not None:
+                losses['out_loss'] = loss_out
             if loss_dino is not None:
                 losses['dino_loss'] = loss_dino
+            if loss_scale is not None:
+                losses['scale_consistency_loss'] = loss_scale
+            if scale_aug is not None:
+                losses['scale_aug_fraction'] = scale_aug['applied'].float().mean()
+                losses['scale_aug_mean'] = scale_aug['scales'].mean()
 
         if self.context:
             output = {

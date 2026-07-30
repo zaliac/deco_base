@@ -168,60 +168,244 @@ class FeatureGrabber:
 # ---------------------------------------------------------------------------
 # Test-time adaptation: scale-consistency self-supervision
 # ---------------------------------------------------------------------------
-def zoom_in_view(image, scale, *, mode='bilinear'):
-    """Center-crop then resize a normalized image without changing its shape.
+def _zoom_scales(scale, batch_size, *, device, dtype):
+    """Normalize a scalar or per-sample zoom tensor to shape ``(B,)``."""
+    scales = torch.as_tensor(scale, device=device, dtype=dtype)
+    if scales.ndim == 0:
+        scales = scales.expand(batch_size)
+    if scales.ndim != 1 or scales.numel() != batch_size:
+        raise ValueError(f'zoom scale must be scalar or ({batch_size},), got {tuple(scales.shape)}')
+    if torch.any(scales < 1.0):
+        raise ValueError('zoom scale must be >= 1.0')
+    return scales
+
+
+def _zoom_centers(center, scales):
+    """Validate crop centres and keep each scaled crop within the image."""
+    batch_size = scales.numel()
+    if center is None:
+        centers = scales.new_full((batch_size, 2), 0.5)
+    else:
+        centers = torch.as_tensor(center, device=scales.device, dtype=scales.dtype)
+        if centers.shape != (batch_size, 2):
+            raise ValueError(f'zoom centre must have shape ({batch_size}, 2), got {tuple(centers.shape)}')
+    half_window = 0.5 / scales[:, None]
+    return centers.clamp(min=half_window, max=1.0 - half_window)
+
+
+def prompt_focus_centers(keypoints=None, object_prompt=None, *, batch_size=None,
+                         device=None, dtype=None):
+    """Return automatic crop centres from body and nearby-object evidence.
+
+    Valid keypoints contribute the centre of their bounding box; a non-empty
+    object prompt contributes the centre of its foreground bounding box.  When
+    both are present, their midpoint keeps the person and possible contact
+    object in the same mild crop.  Missing evidence falls back to image centre.
+    """
+    if keypoints is None and object_prompt is None:
+        if batch_size is None or device is None or dtype is None:
+            raise ValueError('batch_size, device, and dtype are required without prompts')
+        return torch.full((batch_size, 2), 0.5, device=device, dtype=dtype)
+    source = keypoints if keypoints is not None else object_prompt
+    if batch_size is None:
+        batch_size = source.shape[0]
+    if device is None:
+        device = source.device
+    if dtype is None:
+        dtype = torch.float32
+
+    body_centers = torch.zeros(batch_size, 2, device=device, dtype=dtype)
+    has_body = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    if keypoints is not None:
+        if keypoints.ndim != 3 or keypoints.shape[:1] != (batch_size,) or keypoints.shape[-1] != 3:
+            raise ValueError('keypoints must have shape (B, N, 3)')
+        valid = keypoints[..., 2] >= 0
+        for index in range(batch_size):
+            points = keypoints[index, valid[index], :2]
+            if points.numel():
+                body_centers[index] = (points.amin(dim=0) + points.amax(dim=0)) * 0.5
+                has_body[index] = True
+
+    object_centers = torch.zeros(batch_size, 2, device=device, dtype=dtype)
+    has_object = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    if object_prompt is not None:
+        prompt = object_prompt.unsqueeze(1) if object_prompt.ndim == 3 else object_prompt
+        if prompt.ndim != 4 or prompt.shape[0] != batch_size:
+            raise ValueError('object_prompt must have shape (B, H, W) or (B, C, H, W)')
+        mask = prompt.amax(dim=1) > 0
+        height, width = mask.shape[-2:]
+        for index in range(batch_size):
+            ys, xs = torch.where(mask[index])
+            if xs.numel():
+                object_centers[index, 0] = (xs.min() + xs.max() + 1).to(dtype) / (2 * width)
+                object_centers[index, 1] = (ys.min() + ys.max() + 1).to(dtype) / (2 * height)
+                has_object[index] = True
+
+    centers = torch.full((batch_size, 2), 0.5, device=device, dtype=dtype)
+    centers[has_body] = body_centers[has_body]
+    centers[has_object & ~has_body] = object_centers[has_object & ~has_body]
+    both = has_body & has_object
+    centers[both] = (body_centers[both] + object_centers[both]) * 0.5
+    return centers.clamp(0.0, 1.0)
+
+
+def zoom_in_view(image, scale, *, mode='bilinear', center=None):
+    """Crop then resize a normalized image without changing its shape.
 
     ``scale > 1`` magnifies the original crop: output coordinates sample a
-    smaller centred region of the source image.  Keeping the tensor resolution
-    fixed lets the frozen SAM encoders consume each scale exactly as at test
-    time.  ``scale == 1`` is deliberately exact, which makes the helper useful
-    in tests and avoids interpolation drift in the original branch.
+    smaller region of the source image.  The default region is centred; an
+    optional normalized ``center`` selects a prompt-focused crop.  Keeping the
+    tensor resolution fixed lets the frozen SAM encoders consume each scale
+    exactly as at test time.  ``scale == 1`` is deliberately exact, which makes
+    the helper useful in tests and avoids interpolation drift in the original
+    branch.
     """
-    scale = float(scale)
-    if scale < 1.0:
-        raise ValueError('zoom scale must be >= 1.0')
-    if scale == 1.0:
-        return image
     if image.ndim != 4:
         raise ValueError(f'image must be (B, C, H, W), got {tuple(image.shape)}')
     B = image.shape[0]
+    scales = _zoom_scales(scale, B, device=image.device, dtype=image.dtype)
+    if torch.all(scales == 1.0):
+        return image
+    centers = _zoom_centers(center, scales)
     theta = image.new_zeros(B, 2, 3)
-    theta[:, 0, 0] = 1.0 / scale
-    theta[:, 1, 1] = 1.0 / scale
+    theta[:, 0, 0] = 1.0 / scales
+    theta[:, 1, 1] = 1.0 / scales
+    theta[:, :, 2] = 2.0 * centers - 1.0
     grid = F.affine_grid(theta, image.shape, align_corners=False)
     kwargs = {'mode': mode, 'padding_mode': 'border', 'align_corners': False}
     return F.grid_sample(image, grid, **kwargs)
 
 
-def zoom_keypoints(keypoints, scale):
-    """Transform normalized SAM prompt points into a centred zoom view."""
-    if keypoints is None or float(scale) == 1.0:
+def zoom_keypoints(keypoints, scale, *, center=None):
+    """Transform normalized SAM prompt points into a zoom view."""
+    if keypoints is None:
         return keypoints
     if keypoints.ndim != 3 or keypoints.shape[-1] != 3:
         raise ValueError('keypoints must have shape (B, N, 3)')
+    scales = _zoom_scales(scale, keypoints.shape[0], device=keypoints.device, dtype=keypoints.dtype)
+    if torch.all(scales == 1.0):
+        return keypoints
+    centers = _zoom_centers(center, scales)
     transformed = keypoints.clone()
-    transformed[..., :2] = 0.5 + (transformed[..., :2] - 0.5) * float(scale)
+    transformed[..., :2] = 0.5 + (transformed[..., :2] - centers[:, None, :]) * scales[:, None, None]
     outside = ((transformed[..., :2] < 0) | (transformed[..., :2] > 1)).any(dim=-1)
     transformed[..., :2].clamp_(0, 1)
     transformed[..., 2][outside] = -2
     return transformed
 
 
+def _prompt_retention(prompt, scales, centers):
+    """Fraction of a binary object prompt retained by each centred crop."""
+    if prompt.ndim == 3:
+        prompt = prompt.unsqueeze(1)
+    if prompt.ndim != 4:
+        raise ValueError('object_prompt must have shape (B, H, W) or (B, C, H, W)')
+    _, _, height, width = prompt.shape
+    y = (torch.arange(height, device=prompt.device, dtype=scales.dtype) + 0.5) / height
+    x = (torch.arange(width, device=prompt.device, dtype=scales.dtype) + 0.5) / width
+    half_window = 0.5 / scales[:, None, None]
+    retained_window = (
+        (x.view(1, 1, width) - centers[:, 0, None, None]).abs() <= half_window
+    ) & (
+        (y.view(1, height, 1) - centers[:, 1, None, None]).abs() <= half_window
+    )
+    foreground = (prompt > 0).to(dtype=scales.dtype)
+    total = foreground.sum(dim=(1, 2, 3))
+    retained = (foreground * retained_window[:, None]).sum(dim=(1, 2, 3))
+    # An empty proposal is no evidence either way, so it must not reject a
+    # scale view by itself.
+    return torch.where(total > 0, retained / total.clamp_min(1.0), torch.ones_like(total))
+
+
+def training_zoom_view(image, *, keypoints=None, object_prompt=None,
+                       min_scale=1.02, max_scale=1.15, probability=0.5,
+                       min_keypoint_retention=0.8, min_object_retention=0.8,
+                       focus_prompts=True):
+    """Build a conservative, mild prompt-focused zoom for contact-head training.
+
+    Sampling is per image.  A proposed zoom falls back to the original view if
+    it would discard too much valid SAM body-prompt or object-prompt evidence.
+    The returned ``applied`` mask identifies samples for which scale
+    consistency is meaningful; unchanged 3D contact labels remain valid for
+    both the zoomed and fallback samples.
+    """
+    if image.ndim != 4:
+        raise ValueError(f'image must be (B, C, H, W), got {tuple(image.shape)}')
+    if not (1.0 <= min_scale <= max_scale):
+        raise ValueError('training zoom scales must satisfy 1.0 <= min_scale <= max_scale')
+    if not (0.0 <= probability <= 1.0):
+        raise ValueError('training zoom probability must lie in [0, 1]')
+    if not (0.0 <= min_keypoint_retention <= 1.0 and 0.0 <= min_object_retention <= 1.0):
+        raise ValueError('prompt-retention thresholds must lie in [0, 1]')
+
+    batch_size = image.shape[0]
+    scales = image.new_empty(batch_size).uniform_(float(min_scale), float(max_scale))
+    focus_center = (
+        prompt_focus_centers(keypoints, object_prompt, batch_size=batch_size,
+                             device=image.device, dtype=image.dtype)
+        if focus_prompts else image.new_full((batch_size, 2), 0.5)
+    )
+    centers = _zoom_centers(focus_center, scales)
+    requested = torch.rand(batch_size, device=image.device) < float(probability)
+    keep = requested.clone()
+    keypoint_retention = image.new_ones(batch_size)
+    object_retention = image.new_ones(batch_size)
+
+    zoom_keypoints_ = zoom_keypoints(keypoints, scales, center=centers)
+    if keypoints is not None:
+        original_valid = keypoints[..., 2] >= 0
+        zoom_valid = zoom_keypoints_[..., 2] >= 0
+        original_count = original_valid.sum(dim=1)
+        keypoint_retention = zoom_valid.sum(dim=1).to(image.dtype) / original_count.clamp_min(1).to(image.dtype)
+        keep &= (original_count == 0) | (keypoint_retention >= float(min_keypoint_retention))
+
+    zoom_prompt = None
+    if object_prompt is not None:
+        prompt_for_zoom = object_prompt.unsqueeze(1) if object_prompt.ndim == 3 else object_prompt
+        zoom_prompt = zoom_in_view(prompt_for_zoom.float(), scales, mode='nearest', center=centers).to(object_prompt.dtype)
+        object_retention = _prompt_retention(prompt_for_zoom, scales, centers)
+        keep &= object_retention >= float(min_object_retention)
+
+    zoom_image = zoom_in_view(image, scales, center=centers)
+    image_out = torch.where(keep[:, None, None, None], zoom_image, image)
+    keypoints_out = None
+    if keypoints is not None:
+        keypoints_out = torch.where(keep[:, None, None], zoom_keypoints_, keypoints)
+    prompt_out = None
+    if object_prompt is not None:
+        prompt_out = torch.where(keep[:, None, None, None], zoom_prompt, prompt_for_zoom)
+        if object_prompt.ndim == 3:
+            prompt_out = prompt_out.squeeze(1)
+
+    return {
+        'image': image_out,
+        'keypoints': keypoints_out,
+        'object_prompt': prompt_out,
+        'applied': keep,
+        'scales': scales,
+        'centers': centers,
+        'keypoint_retention': keypoint_retention,
+        'object_retention': object_retention,
+    }
+
+
 class TestTimeScalingAdapter:
     """Per-instance, scale-consistency adaptation with no labels or geometry.
 
-    The original crop is the EMA-teacher view.  Each centred zoom is a student
-    view of that same crop and is trained to reproduce the teacher's per-vertex
-    contact probabilities.  Adaptation changes only fusion/contact weights;
-    frozen encoders are shared and every mutable state is restored after the
-    instance.  Final output averages original and zoomed predictions, so the
-    high-resolution zoom evidence directly contributes at inference time.
+    The original crop is the EMA-teacher view.  Each prompt-focused (or centred
+    fallback) zoom is a student view of that same crop and is trained to
+    reproduce the teacher's per-vertex contact probabilities.  Adaptation
+    changes only fusion/contact weights; frozen encoders are shared and every
+    mutable state is restored after the instance.  Final output averages
+    original and zoomed predictions, so high-resolution evidence directly
+    contributes at inference time.
     """
     __test__ = False
 
     def __init__(self, model, device, *, steps=2, learning_rate=1e-5,
                  zoom_scales=(1.25, 1.5), consistency_weight=1.0,
-                 ensemble_original_weight=1.0, ema_momentum=0.996):
+                 ensemble_original_weight=1.0, ema_momentum=0.996,
+                 focus_prompts=True):
         if not hasattr(model, 'cross_att') or not hasattr(model, 'classif'):
             raise ValueError('scale TTA requires model.cross_att and model.classif')
         scales = tuple(float(scale) for scale in zoom_scales)
@@ -236,6 +420,7 @@ class TestTimeScalingAdapter:
         self.consistency_weight = float(consistency_weight)
         self.ensemble_original_weight = float(ensemble_original_weight)
         self.ema_momentum = float(ema_momentum)
+        self.focus_prompts = bool(focus_prompts)
         self._requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
         for parameter in model.parameters():
             parameter.requires_grad_(False)
@@ -283,13 +468,20 @@ class TestTimeScalingAdapter:
             self.model.cross_att, self.model.classif = student_cross, student_classif
 
     def _zoom_inputs(self, image, keypoints, object_prompt, scale):
-        zoom_image = zoom_in_view(image, scale)
+        center = (
+            prompt_focus_centers(keypoints, object_prompt, batch_size=image.shape[0],
+                                 device=image.device, dtype=image.dtype)
+            if self.focus_prompts else None
+        )
+        zoom_image = zoom_in_view(image, scale, center=center)
         zoom_prompt = None
         if object_prompt is not None:
             if object_prompt.ndim == 3:
                 object_prompt = object_prompt.unsqueeze(1)
-            zoom_prompt = zoom_in_view(object_prompt.float(), scale, mode='nearest').to(object_prompt.dtype)
-        return zoom_image, zoom_keypoints(keypoints, scale), zoom_prompt
+            zoom_prompt = zoom_in_view(
+                object_prompt.float(), scale, mode='nearest', center=center,
+            ).to(object_prompt.dtype)
+        return zoom_image, zoom_keypoints(keypoints, scale, center=center), zoom_prompt
 
     def adapt_and_predict(self, image, *, keypoints=None, object_prompt=None):
         """Adapt on zoomed copies of one batch and return an ensemble prediction."""

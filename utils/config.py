@@ -115,7 +115,7 @@ def get_grid_search_configs(config, excluded_keys=[]):
 
     for exp_id, exp in enumerate(experiments):
         for param in excluded_keys:
-            if isinstance(exp[param], str):
+            if param in exp and isinstance(exp[param], str):
                 exp[param] = exp[param].strip().split('+')
         for param_name, param_value in exp.items():
             # print(param_name,type(param_value))

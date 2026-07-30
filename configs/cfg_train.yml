@@ -27,6 +27,14 @@ TRAINING:
   DISTILL_DINO_WEIGHT: 0.04    # feature-DINO prototype CE (the named DINO method); 0 = output-consistency only
   DISTILL_OUT_WEIGHT: 1.0     # output-consistency MSE on contact probs (on-task, primary)
   DISTILL_RAMP_STEPS: 4000    # warm distill terms 0->1 over ~first 2 epochs (tune to steps/epoch)
+  DISTILL_SCALE_AUG_ENABLED: True
+  DISTILL_SCALE_AUG_PROBABILITY: 0.5
+  DISTILL_SCALE_AUG_MIN: 1.02
+  DISTILL_SCALE_AUG_MAX: 1.15
+  DISTILL_SCALE_CONSISTENCY_WEIGHT: 0.25
+  DISTILL_SCALE_AUG_MIN_KEYPOINT_RETENTION: 0.8
+  DISTILL_SCALE_AUG_MIN_OBJECT_RETENTION: 0.8
+  DISTILL_SCALE_AUG_FOCUS_PROMPTS: True
 VALIDATION:
   SUMMARY_STEPS: 5
   DATASETS: ['damon']
