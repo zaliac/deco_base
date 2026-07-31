@@ -404,21 +404,26 @@ class TestTimeScalingAdapter:
 
     def __init__(self, model, device, *, steps=2, learning_rate=1e-5,
                  zoom_scales=(1.25, 1.5), consistency_weight=1.0,
-                 ensemble_original_weight=1.0, ema_momentum=0.996,
+                 ensemble_original_weight=1.0, original_anchor_weight=1.0,
+                 ema_momentum=0.996,
                  focus_prompts=True):
         if not hasattr(model, 'cross_att') or not hasattr(model, 'classif'):
             raise ValueError('scale TTA requires model.cross_att and model.classif')
         scales = tuple(float(scale) for scale in zoom_scales)
         if not scales or any(scale <= 1.0 for scale in scales):
             raise ValueError('ZOOM_SCALES must contain one or more values greater than 1.0')
-        if consistency_weight <= 0 or ensemble_original_weight < 0:
-            raise ValueError('consistency_weight must be positive and original weight non-negative')
+        if (consistency_weight <= 0 or ensemble_original_weight < 0
+                or original_anchor_weight < 0):
+            raise ValueError(
+                'consistency_weight must be positive; ensemble and anchor weights must be non-negative'
+            )
         self.model = model
         self.device = torch.device(device)
         self.steps = max(int(steps), 0)
         self.zoom_scales = scales
         self.consistency_weight = float(consistency_weight)
         self.ensemble_original_weight = float(ensemble_original_weight)
+        self.original_anchor_weight = float(original_anchor_weight)
         self.ema_momentum = float(ema_momentum)
         self.focus_prompts = bool(focus_prompts)
         self._requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
@@ -490,8 +495,20 @@ class TestTimeScalingAdapter:
         self.model.eval()
         self.teacher_cross_att.eval()
         self.teacher_classif.eval()
-        diagnostics = {'loss': 0.0, 'scale_consistency_loss': 0.0, 'steps': self.steps}
+        diagnostics = {
+            'loss': 0.0,
+            'scale_consistency_loss': 0.0,
+            'original_anchor_loss': 0.0,
+            'steps': self.steps,
+        }
         try:
+            # Preserve the checkpoint's original-view output.  The final
+            # ensemble must be anchored to this unadapted prediction, rather
+            # than to a student that may have overfit one image's zoom views.
+            with torch.no_grad():
+                original_prediction = self._teacher_forward(
+                    image, keypoints, object_prompt,
+                ).detach()
             for _ in range(self.steps):
                 with torch.no_grad():
                     target = self._teacher_forward(image, keypoints, object_prompt).detach()
@@ -503,7 +520,16 @@ class TestTimeScalingAdapter:
                     prediction = self._forward(zoom_image, zoom_keypoints_, zoom_prompt)
                     losses.append(F.mse_loss(prediction, target))
                 consistency = torch.stack(losses).mean()
-                total = self.consistency_weight * consistency
+                # The zoom loss alone gives no constraint on how the update
+                # changes the original crop.  This anchor penalizes that
+                # drift while preserving a fully label-free objective.
+                original_anchor = F.mse_loss(
+                    self._forward(image, keypoints, object_prompt), original_prediction,
+                )
+                total = (
+                    self.consistency_weight * consistency
+                    + self.original_anchor_weight * original_anchor
+                )
                 self.optimizer.zero_grad(set_to_none=True)
                 total.backward()
                 self.optimizer.step()
@@ -512,9 +538,12 @@ class TestTimeScalingAdapter:
                 diagnostics.update({
                     'loss': float(total.detach().cpu()),
                     'scale_consistency_loss': float(consistency.detach().cpu()),
+                    'original_anchor_loss': float(original_anchor.detach().cpu()),
                 })
             with torch.no_grad():
-                predictions = [self._forward(image, keypoints, object_prompt)]
+                # Use the saved checkpoint view, never the adapted original
+                # view, as the ensemble anchor.
+                predictions = [original_prediction]
                 weights = [self.ensemble_original_weight]
                 for scale in self.zoom_scales:
                     zoom_image, zoom_keypoints_, zoom_prompt = self._zoom_inputs(

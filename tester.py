@@ -28,6 +28,9 @@ from train.base_trainer import evaluator
 from data.base_dataset import BaseDataset
 from models.deco import DECO
 from utils.config import parse_args, run_grid_search_experiments
+from datetime import datetime
+import os
+
 
 def test(hparams):
     deco_model = DECO(hparams.TRAINING.ENCODER, hparams.TRAINING.CONTEXT, device)
@@ -45,6 +48,7 @@ def test(hparams):
             zoom_scales=hparams.TEST_TIME.ZOOM_SCALES,
             consistency_weight=hparams.TEST_TIME.CONSISTENCY_WEIGHT,
             ensemble_original_weight=hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT,
+            original_anchor_weight=hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT,
             ema_momentum=hparams.TEST_TIME.EMA_MOMENTUM,
             focus_prompts=hparams.TEST_TIME.FOCUS_PROMPTS,
         )
@@ -52,26 +56,66 @@ def test(hparams):
             f'Task-7 scale TTA enabled: {hparams.TEST_TIME.STEPS} steps/image, '
             f'zooms {list(hparams.TEST_TIME.ZOOM_SCALES)}, '
             f'consistency weight {hparams.TEST_TIME.CONSISTENCY_WEIGHT:g}, '
+            f'original anchor weight {hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT:g}, '
             f'prompt focus {hparams.TEST_TIME.FOCUS_PROMPTS}'
         )
     
     # Run testing
-    for test_loader in val_loaders:
-        dataset_name = test_loader.dataset.dataset
-        test_dict, total_time = evaluator(test_loader, solver, hparams, 0, dataset_name, return_dict=True)
+    # for test_loader in val_loaders:
+    #     dataset_name = test_loader.dataset.dataset
+    #     test_dict, total_time = evaluator(test_loader, solver, hparams, 0, dataset_name, return_dict=True)
+    #
+    #     print('Test Contact Precision: ', test_dict['cont_precision'])
+    #     print('Test Contact Recall: ', test_dict['cont_recall'])
+    #     print('Test Contact F1 Score: ', test_dict['cont_f1'])
+    #     print('Test Contact F1 Score (paper: harmonic of mean P/R): ', test_dict['cont_f1_paper'])
+    #     print('Test Contact FP Geo. Error: ', test_dict['fp_geo_err'])
+    #     print('Test Contact FN Geo. Error: ', test_dict['fn_geo_err'])
+    #     if hparams.TRAINING.CONTEXT:
+    #         print('Test Contact Semantic Segmentation IoU: ', test_dict['sem_iou'])
+    #         print('Test Contact Part Segmentation IoU: ', test_dict['part_iou'])
+    #     print('\nTime taken per image for evaluation: ', total_time)
+    #     print('-'*50)
+    # Create log directory (optional)
+    log_dir = "test_logs"
+    os.makedirs(log_dir, exist_ok=True)
 
-        print('Test Contact Precision: ', test_dict['cont_precision'])
-        print('Test Contact Recall: ', test_dict['cont_recall'])
-        print('Test Contact F1 Score: ', test_dict['cont_f1'])
-        print('Test Contact F1 Score (paper: harmonic of mean P/R): ', test_dict['cont_f1_paper'])
-        print('Test Contact FP Geo. Error: ', test_dict['fp_geo_err'])
-        print('Test Contact FN Geo. Error: ', test_dict['fn_geo_err'])
-        if hparams.TRAINING.CONTEXT:
-            print('Test Contact Semantic Segmentation IoU: ', test_dict['sem_iou'])
-            print('Test Contact Part Segmentation IoU: ', test_dict['part_iou'])
-        print('\nTime taken per image for evaluation: ', total_time)
-        print('-'*50)
+    # Create timestamped log file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"test_results_{timestamp}.txt")
 
+    with open(log_file, "w") as f:
+
+        # Run testing
+        for test_loader in val_loaders:
+            dataset_name = test_loader.dataset.dataset
+            test_dict, total_time = evaluator(test_loader, solver, hparams, 0, dataset_name, return_dict=True)
+
+            messages = [
+                f"Dataset: {dataset_name}",
+                f"Test Contact Precision: {test_dict['cont_precision']:.4f}",
+                f"Test Contact Recall: {test_dict['cont_recall']:.4f}",
+                f"Test Contact F1 Score: {test_dict['cont_f1']:.4f}",
+                f"Test Contact F1 Score (paper: harmonic of mean P/R): {test_dict['cont_f1_paper']:.4f}",
+                f"Test Contact FP Geo. Error: {test_dict['fp_geo_err']:.4f}",
+                f"Test Contact FN Geo. Error: {test_dict['fn_geo_err']:.4f}",
+            ]
+
+            if hparams.TRAINING.CONTEXT:
+                messages.extend([
+                    f"Test Contact Semantic Segmentation IoU: {test_dict['sem_iou']:.4f}",
+                    f"Test Contact Part Segmentation IoU: {test_dict['part_iou']:.4f}",
+                ])
+
+            messages.extend([
+                f"Time taken per image for evaluation: {total_time:.6f}",
+                "-" * 50,
+            ])
+
+            # Print to terminal and write to file
+            for msg in messages:
+                print(msg)
+                f.write(msg + "\n")
     if solver.test_time_adapter is not None:
         solver.test_time_adapter.close()
 

@@ -69,6 +69,10 @@ hparams.TEST_TIME.LR = 1e-5
 hparams.TEST_TIME.ZOOM_SCALES = [1.25, 1.5]
 hparams.TEST_TIME.CONSISTENCY_WEIGHT = 1.0
 hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT = 1.0
+# Keep the adapted original crop close to its checkpoint prediction.  This is
+# particularly important for per-image adaptation, where one update can
+# otherwise degrade the most reliable (unzoomed) view.
+hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT = 1.0
 hparams.TEST_TIME.EMA_MOMENTUM = 0.996
 hparams.TEST_TIME.FOCUS_PROMPTS = True
 

@@ -412,9 +412,12 @@ class TrainStepper():
             # evaluated once from the restored checkpoint and remain comparable
             # to the non-TTA segmentation protocol.
             if self.context:
-                _, sem_mask_pred, part_mask_pred = self.model(
-                    img, keypoints=keypoints, object_prompt=object_prompt
-                )
+                # TTA requires gradients only inside the adapter.  The
+                # unchanged segmentation heads must stay inference-only.
+                with torch.no_grad():
+                    _, sem_mask_pred, part_mask_pred = self.model(
+                        img, keypoints=keypoints, object_prompt=object_prompt
+                    )
         elif self.context:
             cont, sem_mask_pred, part_mask_pred = self.model(
                 img, keypoints=keypoints, object_prompt=object_prompt
