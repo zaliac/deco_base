@@ -50,6 +50,7 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
     val_epoch_cont_loss = np.zeros(dataset_size)
     
     total_time = 0
+    contact_threshold = float(getattr(hparams.TEST_TIME, 'CONTACT_THRESHOLD', 0.5))
 
     rend_images = []
     # Mesh previews are only consumed by TensorBoard.  In standalone testing
@@ -96,8 +97,12 @@ def evaluator(val_loader, solver, hparams, epoch=0, dataset_name='Unknown', norm
             part_mask_gt = output['part_mask_gt']
             part_seg_pred = output['part_mask_pred']
 
-        cont_pre, cont_rec, cont_f1 = precision_recall_f1score(contact_labels_3d, contact_labels_3d_pred)
-        fp_geo_err, fn_geo_err = det_error_metric(contact_labels_3d_pred, contact_labels_3d)
+        cont_pre, cont_rec, cont_f1 = precision_recall_f1score(
+            contact_labels_3d, contact_labels_3d_pred, threshold=contact_threshold,
+        )
+        fp_geo_err, fn_geo_err = det_error_metric(
+            contact_labels_3d_pred, contact_labels_3d, threshold=contact_threshold,
+        )
         if hparams.TRAINING.CONTEXT:
             sem_iou = metric(sem_mask_gt, sem_seg_pred)
             part_iou = metric(part_mask_gt, part_seg_pred)

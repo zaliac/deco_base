@@ -36,6 +36,8 @@ class BaseDataset(Dataset):
             model_type='smpl',
             dataset_root_path='',
             normalize=False,
+            return_highres_tta=False,
+            highres_size=512,
             generate_object_masks=False,
             sam_checkpoint_path=None,
             sam_model_type='vit_b',
@@ -163,6 +165,10 @@ class BaseDataset(Dataset):
 
         self.normalize = normalize
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
+        self.return_highres_tta = bool(return_highres_tta)
+        self.highres_size = int(highres_size)
+        if self.return_highres_tta and self.highres_size < 256:
+            raise ValueError('highres_size must be at least 256 when high-resolution TTA is enabled')
 
     def _get_sam_predictor(self):
         """Lazily obtain a SAM predictor for the per-keypoint circle prompts."""
@@ -303,7 +309,8 @@ class BaseDataset(Dataset):
             return self._select_sam_object_mask(annotations, source_size)
         return None
 
-    def _object_mask_for_image(self, index, image_with_alpha, source_size, crop_bbox):
+    def _object_mask_for_image(self, index, image_with_alpha, source_size, crop_bbox,
+                               output_size=(256, 256)):
         """Resolve/cache a mask, then mirror the RGB crop/resize exactly."""
         mask = self.object_masks[index]
         has_object_mask = mask is not None and bool(np.any(mask))
@@ -346,7 +353,7 @@ class BaseDataset(Dataset):
             mask,
             crop_bbox=crop_bbox,
             source_size=source_size,
-            output_size=(256, 256),
+            output_size=output_size,
         )
         return mask, has_object_mask
 
@@ -375,8 +382,17 @@ class BaseDataset(Dataset):
                     crop_bbox = candidate_bbox
 
             object_mask, has_object_mask = self._object_mask_for_image(
-                index, loaded_img, source_size, crop_bbox
+                index, loaded_img, source_size, crop_bbox, output_size=(256, 256)
             )
+            object_mask_highres = None
+            if self.return_highres_tta:
+                # Build the zoom source from the original crop, not from the
+                # already resized 256px tensor.  The cached source mask keeps
+                # this second resize cheap and preserves RGB/prompt alignment.
+                object_mask_highres, _ = self._object_mask_for_image(
+                    index, loaded_img, source_size, crop_bbox,
+                    output_size=(self.highres_size, self.highres_size),
+                )
             img = loaded_img[:, :, :3]
             if crop_bbox is not None:
                 x0, y0, x1, y1 = crop_bbox
@@ -384,8 +400,12 @@ class BaseDataset(Dataset):
             img_h, img_w, _ = img.shape
             if img_h == 0 or img_w == 0:
                 raise ValueError(f'Empty image crop for {img_path}')
-            img = cv2.resize(img, (256, 256), cv2.INTER_CUBIC)
-            img = img.transpose(2, 0, 1) / 255.0
+            img_highres = None
+            if self.return_highres_tta:
+                img_highres = cv2.resize(
+                    img, (self.highres_size, self.highres_size), cv2.INTER_CUBIC,
+                ).transpose(2, 0, 1) / 255.0
+            img = cv2.resize(img, (256, 256), cv2.INTER_CUBIC).transpose(2, 0, 1) / 255.0
         except (FileNotFoundError, ValueError, TypeError, cv2.error) as exc:
             raise RuntimeError(f'Could not load image/mask pair {img_path}: {exc}') from exc
 
@@ -448,8 +468,14 @@ class BaseDataset(Dataset):
         if self.normalize:
             img = torch.tensor(img, dtype=torch.float32)
             item['img'] = self.normalize_img(img)
+            if img_highres is not None:
+                item['img_highres'] = self.normalize_img(
+                    torch.tensor(img_highres, dtype=torch.float32)
+                )
         else:
             item['img'] = torch.tensor(img, dtype=torch.float32)
+            if img_highres is not None:
+                item['img_highres'] = torch.tensor(img_highres, dtype=torch.float32)
 
         if self.is_smplx[index]:
             # Add 6 zeros to the end of the pose vector to match with smpl
@@ -470,6 +496,10 @@ class BaseDataset(Dataset):
         object_prompt = torch.tensor(object_mask[None], dtype=torch.float32)
         item['object_prompt'] = object_prompt
         item['object_mask'] = object_prompt
+        if object_mask_highres is not None:
+            item['object_prompt_highres'] = torch.tensor(
+                object_mask_highres[None], dtype=torch.float32,
+            )
         item['has_object_mask'] = torch.tensor(float(has_object_mask), dtype=torch.float32)
 
         # 2D keypoint prompts (COCO-17), in ORIGINAL-image pixels, + per-keypoint confidence.

@@ -49,6 +49,9 @@ def test(hparams):
             consistency_weight=hparams.TEST_TIME.CONSISTENCY_WEIGHT,
             ensemble_original_weight=hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT,
             original_anchor_weight=hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT,
+            highres_zoom_enabled=hparams.TEST_TIME.HIGHRES_ZOOM_ENABLED,
+            min_keypoint_retention=hparams.TEST_TIME.MIN_KEYPOINT_RETENTION,
+            min_object_retention=hparams.TEST_TIME.MIN_OBJECT_RETENTION,
             ema_momentum=hparams.TEST_TIME.EMA_MOMENTUM,
             focus_prompts=hparams.TEST_TIME.FOCUS_PROMPTS,
         )
@@ -57,6 +60,8 @@ def test(hparams):
             f'zooms {list(hparams.TEST_TIME.ZOOM_SCALES)}, '
             f'consistency weight {hparams.TEST_TIME.CONSISTENCY_WEIGHT:g}, '
             f'original anchor weight {hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT:g}, '
+            f'high-res zoom {hparams.TEST_TIME.HIGHRES_ZOOM_ENABLED} '
+            f'({hparams.TEST_TIME.HIGHRES_SIZE}px), '
             f'prompt focus {hparams.TEST_TIME.FOCUS_PROMPTS}'
         )
     
@@ -142,17 +147,25 @@ if __name__ == '__main__':
         'sam_keypoint_circle_radius': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS,
         'sam_keypoint_circle_points': hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS,
     }
+    tta_highres_kwargs = {
+        'return_highres_tta': bool(
+            hparams.TEST_TIME.ENABLED and hparams.TEST_TIME.HIGHRES_ZOOM_ENABLED
+        ),
+        'highres_size': hparams.TEST_TIME.HIGHRES_SIZE,
+    }
     for ds in hparams.VALIDATION.DATASETS:
         if ds in ['rich', 'prox']:
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smplx', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                **tta_highres_kwargs,
                 **sam_object_mask_kwargs,
             ))
         elif ds in ['damon', 'behave']:
             val_datasets.append(BaseDataset(
                 ds, 'val', model_type='smpl', dataset_root_path=dataset_root_path,
                 normalize=hparams.DATASET.NORMALIZE_IMAGES,
+                **tta_highres_kwargs,
                 **sam_object_mask_kwargs,
             ))
         else:

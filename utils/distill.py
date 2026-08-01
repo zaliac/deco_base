@@ -405,6 +405,8 @@ class TestTimeScalingAdapter:
     def __init__(self, model, device, *, steps=2, learning_rate=1e-5,
                  zoom_scales=(1.25, 1.5), consistency_weight=1.0,
                  ensemble_original_weight=1.0, original_anchor_weight=1.0,
+                 highres_zoom_enabled=True, min_keypoint_retention=0.8,
+                 min_object_retention=0.8,
                  ema_momentum=0.996,
                  focus_prompts=True):
         if not hasattr(model, 'cross_att') or not hasattr(model, 'classif'):
@@ -412,11 +414,13 @@ class TestTimeScalingAdapter:
         scales = tuple(float(scale) for scale in zoom_scales)
         if not scales or any(scale <= 1.0 for scale in scales):
             raise ValueError('ZOOM_SCALES must contain one or more values greater than 1.0')
-        if (consistency_weight <= 0 or ensemble_original_weight < 0
+        if (consistency_weight <= 0 or ensemble_original_weight <= 0
                 or original_anchor_weight < 0):
             raise ValueError(
-                'consistency_weight must be positive; ensemble and anchor weights must be non-negative'
+                'consistency and ensemble weights must be positive; anchor weight must be non-negative'
             )
+        if not (0.0 <= min_keypoint_retention <= 1.0 and 0.0 <= min_object_retention <= 1.0):
+            raise ValueError('zoom prompt-retention thresholds must lie in [0, 1]')
         self.model = model
         self.device = torch.device(device)
         self.steps = max(int(steps), 0)
@@ -424,6 +428,9 @@ class TestTimeScalingAdapter:
         self.consistency_weight = float(consistency_weight)
         self.ensemble_original_weight = float(ensemble_original_weight)
         self.original_anchor_weight = float(original_anchor_weight)
+        self.highres_zoom_enabled = bool(highres_zoom_enabled)
+        self.min_keypoint_retention = float(min_keypoint_retention)
+        self.min_object_retention = float(min_object_retention)
         self.ema_momentum = float(ema_momentum)
         self.focus_prompts = bool(focus_prompts)
         self._requires_grad = {name: p.requires_grad for name, p in model.named_parameters()}
@@ -472,23 +479,83 @@ class TestTimeScalingAdapter:
         finally:
             self.model.cross_att, self.model.classif = student_cross, student_classif
 
-    def _zoom_inputs(self, image, keypoints, object_prompt, scale):
+    def _zoom_inputs(self, image, keypoints, object_prompt, scale, *,
+                     highres_image=None, highres_object_prompt=None,
+                     has_object_prompt=None):
+        """Create a conservative zoom, preferably from the original crop.
+
+        ``highres_image`` is a 512px (by default) resize of the original crop.
+        Cropping it before reducing back to the model's 256px input retains
+        source detail; falling back to ``image`` preserves old checkpoints and
+        non-TTA callers.  Invalid/cropped-away prompts are marked so their
+        zoom prediction cannot affect the ensemble or adaptation loss.
+        """
+        use_highres = self.highres_zoom_enabled and highres_image is not None
+        source_image = highres_image if use_highres else image
+        source_prompt = (
+            highres_object_prompt
+            if use_highres and highres_object_prompt is not None
+            else object_prompt
+        )
         center = (
-            prompt_focus_centers(keypoints, object_prompt, batch_size=image.shape[0],
+            prompt_focus_centers(keypoints, source_prompt, batch_size=image.shape[0],
                                  device=image.device, dtype=image.dtype)
             if self.focus_prompts else None
         )
-        zoom_image = zoom_in_view(image, scale, center=center)
+        zoom_image = zoom_in_view(source_image, scale, center=center)
+        if zoom_image.shape[-2:] != image.shape[-2:]:
+            zoom_image = F.interpolate(
+                zoom_image, size=image.shape[-2:], mode='bilinear', align_corners=False,
+            )
         zoom_prompt = None
-        if object_prompt is not None:
-            if object_prompt.ndim == 3:
-                object_prompt = object_prompt.unsqueeze(1)
+        if source_prompt is not None:
+            prompt = source_prompt.unsqueeze(1) if source_prompt.ndim == 3 else source_prompt
             zoom_prompt = zoom_in_view(
-                object_prompt.float(), scale, mode='nearest', center=center,
-            ).to(object_prompt.dtype)
-        return zoom_image, zoom_keypoints(keypoints, scale, center=center), zoom_prompt
+                prompt.float(), scale, mode='nearest', center=center,
+            )
+            if zoom_prompt.shape[-2:] != image.shape[-2:]:
+                zoom_prompt = F.interpolate(zoom_prompt, size=image.shape[-2:], mode='nearest')
+            zoom_prompt = zoom_prompt.to(prompt.dtype)
 
-    def adapt_and_predict(self, image, *, keypoints=None, object_prompt=None):
+        batch_size = image.shape[0]
+        scales = _zoom_scales(scale, batch_size, device=image.device, dtype=image.dtype)
+        centers = _zoom_centers(center, scales)
+        valid = torch.ones(batch_size, device=image.device, dtype=torch.bool)
+        keypoint_retention = image.new_ones(batch_size)
+        zoom_keypoints_ = zoom_keypoints(keypoints, scale, center=center)
+        if keypoints is not None:
+            original_valid = keypoints[..., 2] >= 0
+            zoom_valid = zoom_keypoints_[..., 2] >= 0
+            original_count = original_valid.sum(dim=1)
+            keypoint_retention = (
+                zoom_valid.sum(dim=1).to(image.dtype)
+                / original_count.clamp_min(1).to(image.dtype)
+            )
+            valid &= (original_count == 0) | (keypoint_retention >= self.min_keypoint_retention)
+
+        object_retention = image.new_ones(batch_size)
+        if source_prompt is not None:
+            object_retention = _prompt_retention(prompt, scales, centers)
+            if has_object_prompt is None:
+                has_object_evidence = torch.ones(batch_size, device=image.device, dtype=torch.bool)
+            else:
+                has_object_evidence = has_object_prompt.to(device=image.device).reshape(batch_size) >= 0.5
+            # A full-frame fallback prompt carries no object-boundary evidence;
+            # do not reject a zoom merely because that sentinel is cropped.
+            valid &= (~has_object_evidence) | (object_retention >= self.min_object_retention)
+
+        return {
+            'image': zoom_image,
+            'keypoints': zoom_keypoints_,
+            'object_prompt': zoom_prompt,
+            'valid': valid,
+            'keypoint_retention': keypoint_retention,
+            'object_retention': object_retention,
+        }
+
+    def adapt_and_predict(self, image, *, keypoints=None, object_prompt=None,
+                          highres_image=None, highres_object_prompt=None,
+                          has_object_prompt=None):
         """Adapt on zoomed copies of one batch and return an ensemble prediction."""
         self._reset()
         old_training = self.model.training
@@ -499,6 +566,7 @@ class TestTimeScalingAdapter:
             'loss': 0.0,
             'scale_consistency_loss': 0.0,
             'original_anchor_loss': 0.0,
+            'zoom_valid_fraction': 1.0,
             'steps': self.steps,
         }
         try:
@@ -509,16 +577,35 @@ class TestTimeScalingAdapter:
                 original_prediction = self._teacher_forward(
                     image, keypoints, object_prompt,
                 ).detach()
+            # Geometry/prompt transforms are model-independent, so make every
+            # view once and reuse it for adaptation and final fusion.
+            zoom_views = [
+                self._zoom_inputs(
+                    image, keypoints, object_prompt, scale,
+                    highres_image=highres_image,
+                    highres_object_prompt=highres_object_prompt,
+                    has_object_prompt=has_object_prompt,
+                )
+                for scale in self.zoom_scales
+            ]
+            diagnostics['zoom_valid_fraction'] = float(torch.stack([
+                zoom['valid'].float().mean() for zoom in zoom_views
+            ]).mean().detach().cpu())
             for _ in range(self.steps):
                 with torch.no_grad():
                     target = self._teacher_forward(image, keypoints, object_prompt).detach()
                 losses = []
-                for scale in self.zoom_scales:
-                    zoom_image, zoom_keypoints_, zoom_prompt = self._zoom_inputs(
-                        image, keypoints, object_prompt, scale,
+                for zoom in zoom_views:
+                    prediction = self._forward(
+                        zoom['image'], zoom['keypoints'], zoom['object_prompt'],
                     )
-                    prediction = self._forward(zoom_image, zoom_keypoints_, zoom_prompt)
-                    losses.append(F.mse_loss(prediction, target))
+                    per_sample_loss = (prediction - target).square().mean(dim=1)
+                    if zoom['valid'].any():
+                        losses.append(per_sample_loss[zoom['valid']].mean())
+                # A heavily cropped prompt should not force an update.  The
+                # saved original prediction remains the output for this image.
+                if not losses:
+                    break
                 consistency = torch.stack(losses).mean()
                 # The zoom loss alone gives no constraint on how the update
                 # changes the original crop.  This anchor penalizes that
@@ -544,15 +631,14 @@ class TestTimeScalingAdapter:
                 # Use the saved checkpoint view, never the adapted original
                 # view, as the ensemble anchor.
                 predictions = [original_prediction]
-                weights = [self.ensemble_original_weight]
-                for scale in self.zoom_scales:
-                    zoom_image, zoom_keypoints_, zoom_prompt = self._zoom_inputs(
-                        image, keypoints, object_prompt, scale,
-                    )
-                    predictions.append(self._forward(zoom_image, zoom_keypoints_, zoom_prompt))
-                    weights.append(1.0)
-                weight = image.new_tensor(weights).view(-1, 1, 1)
-                prediction = (torch.stack(predictions, dim=0) * weight).sum(0) / weight.sum()
+                weights = [image.new_full((image.shape[0],), self.ensemble_original_weight)]
+                for zoom in zoom_views:
+                    predictions.append(self._forward(
+                        zoom['image'], zoom['keypoints'], zoom['object_prompt'],
+                    ))
+                    weights.append(zoom['valid'].to(dtype=image.dtype))
+                weight = torch.stack(weights, dim=0).unsqueeze(-1)
+                prediction = (torch.stack(predictions, dim=0) * weight).sum(0) / weight.sum(0).clamp_min(1e-8)
             return prediction.detach(), diagnostics
         finally:
             self._reset()

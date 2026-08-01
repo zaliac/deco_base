@@ -73,6 +73,12 @@ hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT = 1.0
 # particularly important for per-image adaptation, where one update can
 # otherwise degrade the most reliable (unzoomed) view.
 hparams.TEST_TIME.ORIGINAL_ANCHOR_WEIGHT = 1.0
+hparams.TEST_TIME.HIGHRES_ZOOM_ENABLED = True
+hparams.TEST_TIME.HIGHRES_SIZE = 512
+hparams.TEST_TIME.MIN_KEYPOINT_RETENTION = 0.8
+hparams.TEST_TIME.MIN_OBJECT_RETENTION = 0.8
+# Select this only on a held-out validation split, never on the reported test set.
+hparams.TEST_TIME.CONTACT_THRESHOLD = 0.5
 hparams.TEST_TIME.EMA_MOMENTUM = 0.996
 hparams.TEST_TIME.FOCUS_PROMPTS = True
 

@@ -11,7 +11,7 @@ def metric(mask, pred, back=True):
 
   return iou
 
-def precision_recall_f1score(gt, pred):
+def precision_recall_f1score(gt, pred, threshold=0.5):
     """
     Compute precision, recall, and f1
     """
@@ -19,13 +19,15 @@ def precision_recall_f1score(gt, pred):
     # gt = gt.numpy()
     # pred = pred.numpy()
 
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError('contact threshold must lie in [0, 1]')
     precision = torch.zeros(gt.shape[0])
     recall = torch.zeros(gt.shape[0])
     f1 = torch.zeros(gt.shape[0])
     
     for b in range(gt.shape[0]):
-        tp_num = gt[b, pred[b, :] >= 0.5].sum()
-        precision_denominator = (pred[b, :] >= 0.5).sum()
+        tp_num = gt[b, pred[b, :] >= threshold].sum()
+        precision_denominator = (pred[b, :] >= threshold).sum()
         recall_denominator = (gt[b, :]).sum()
 
         precision_ = tp_num / precision_denominator
@@ -83,7 +85,9 @@ def acc_precision_recall_f1score(gt, pred):
     # return precision, recall, f1
     return acc, precision, recall, f1
 
-def det_error_metric(pred, gt):
+def det_error_metric(pred, gt, threshold=0.5):
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError('contact threshold must lie in [0, 1]')
     
     gt = gt.detach().cpu()
     pred = pred.detach().cpu()
@@ -95,7 +99,10 @@ def det_error_metric(pred, gt):
     
     for b in range(gt.shape[0]):
         gt_columns = dist_matrix[:, gt[b, :]==1] if any(gt[b, :]==1) else dist_matrix
-        error_matrix = gt_columns[pred[b, :] >= 0.5, :] if any(pred[b, :] >= 0.5) else gt_columns
+        error_matrix = (
+            gt_columns[pred[b, :] >= threshold, :]
+            if any(pred[b, :] >= threshold) else gt_columns
+        )
 
         false_positive_dist_ = error_matrix.min(dim=1)[0].mean()
         false_negative_dist_ = error_matrix.min(dim=0)[0].mean()

@@ -146,7 +146,6 @@ class TrainStepper():
         object_prompt = batch.get('object_prompt', batch.get('object_mask'))
         if object_prompt is not None:
             object_prompt = object_prompt.to(self.device)
-
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
         pose = batch['pose'].to(self.device)
@@ -367,6 +366,15 @@ class TrainStepper():
         object_prompt = batch.get('object_prompt', batch.get('object_mask'))
         if object_prompt is not None:
             object_prompt = object_prompt.to(self.device)
+        highres_img = batch.get('img_highres')
+        if highres_img is not None:
+            highres_img = highres_img.to(self.device)
+        highres_object_prompt = batch.get('object_prompt_highres')
+        if highres_object_prompt is not None:
+            highres_object_prompt = highres_object_prompt.to(self.device)
+        has_object_prompt = batch.get('has_object_mask')
+        if has_object_prompt is not None:
+            has_object_prompt = has_object_prompt.to(self.device)
 
         img_scale_factor = batch['img_scale_factor'].to(self.device)
 
@@ -399,7 +407,11 @@ class TrainStepper():
             )
 
         # Forward pass
-        initial_time = time.time()
+        # CUDA kernels are asynchronous; synchronize at both boundaries so the
+        # reported TTA latency reflects actual GPU work rather than queue time.
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+        initial_time = time.perf_counter()
         if self.test_time_adapter is not None:
             # ``evaluate`` is intentionally no-grad for ordinary validation;
             # Task-7 opens a narrow autograd scope only around cross_att/classif
@@ -407,6 +419,9 @@ class TrainStepper():
             with torch.enable_grad():
                 cont, tta_stats = self.test_time_adapter.adapt_and_predict(
                     img, keypoints=keypoints, object_prompt=object_prompt,
+                    highres_image=highres_img,
+                    highres_object_prompt=highres_object_prompt,
+                    has_object_prompt=has_object_prompt,
                 )
             # TTA only changes the contact prediction.  Context outputs are
             # evaluated once from the restored checkpoint and remain comparable
@@ -424,7 +439,9 @@ class TrainStepper():
             )
         else:
             cont = self.model(img, keypoints=keypoints, object_prompt=object_prompt)
-        time_taken = time.time() - initial_time
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+        time_taken = time.perf_counter() - initial_time
 
         if self.context:
             loss_sem = self.sem_loss(sem_mask_gt, sem_mask_pred)
