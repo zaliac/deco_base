@@ -151,6 +151,10 @@ def run_grid_search_experiments(
     logger.info(f'======> Number of experiment configurations is {len(different_configs)}')
 
     config_to_run = CN(different_configs[args.cfg_id])
+    # Allow evaluation-only switches (for example, enabling Task-7 TTA after an
+    # original-only baseline) without editing the checked-in YAML file.
+    if args.opts:
+        config_to_run.merge_from_list(args.opts)
 
     if args.cluster:
         execute_task_on_cluster(

@@ -4,6 +4,7 @@ import torch
 import os
 import time
 from utils.distill import build_teacher, ema_update, two_views, DINOHead, DINOLoss, FeatureGrabber
+from utils.multiview_tta import fuse_contact_predictions
 
 
 class TrainStepper():
@@ -64,6 +65,22 @@ class TrainStepper():
         self.loss_weight = loss_weight
         self.pal_loss_weight = pal_loss_weight
         self.distill = False
+        self.multiview_enabled = False
+
+    def enable_multiview_inference(
+        self, *, original_weight=2.0, trim_fraction=0.2,
+        min_positive_iou=0.5, min_agreeing_frames=3,
+    ):
+        """Enable Task-7 rendered-view inference fusion for evaluation only."""
+        if original_weight <= 0:
+            raise ValueError('original_weight must be positive')
+        if not 0.0 <= trim_fraction < 0.5:
+            raise ValueError('trim_fraction must be in [0, 0.5)')
+        self.multiview_enabled = True
+        self.multiview_original_weight = float(original_weight)
+        self.multiview_trim_fraction = float(trim_fraction)
+        self.multiview_min_positive_iou = float(min_positive_iou)
+        self.multiview_min_agreeing_frames = int(min_agreeing_frames)
 
     def enable_distill(self, out_dim=4096, dino_weight=0.0, out_weight=1.0, ema_momentum=0.996,
                        teacher_temp=0.04, student_temp=0.1, center_momentum=0.9, ramp_steps=2000):
@@ -317,6 +334,14 @@ class TrainStepper():
                 has_keypoints=batch['has_keypoints'].to(self.device),
             )
 
+        multiview_frames = batch.get('multiview_frames')
+        multiview_frame_valid = batch.get('multiview_frame_valid')
+        if multiview_frames is not None:
+            # Keep all 21 views in host memory; only the current view moves to
+            # GPU below.  Moving (B, 21, 3, 256, 256) at once is needlessly
+            # expensive on the 3060 Ti.
+            multiview_frame_valid = multiview_frame_valid.to(dtype=torch.bool)
+
         # Forward pass
         initial_time = time.time()
         if self.context:
@@ -325,6 +350,32 @@ class TrainStepper():
             )
         else:
             cont = self.model(img, keypoints=keypoints, object_prompt=object_prompt)
+
+        # Task 7: the original crop plus every available rendered camera view
+        # are forwarded independently. Rendered views have no 2D keypoints or
+        # object mask in their own image coordinates, so do not reuse prompts
+        # from the original photo.  ``frame_index`` is intentionally the outer
+        # loop: one model inference per camera view (22 total when all 21 exist).
+        if self.multiview_enabled and multiview_frames is not None:
+            view_predictions = []
+            for frame_index in range(multiview_frames.shape[1]):
+                if not multiview_frame_valid[:, frame_index].any():
+                    view_predictions.append(cont.detach())
+                    continue
+                view_output = self.model(
+                    multiview_frames[:, frame_index].to(self.device, non_blocking=True),
+                    keypoints=None, object_prompt=None,
+                )
+                view_predictions.append(
+                    view_output[0] if isinstance(view_output, (tuple, list)) else view_output
+                )
+            cont, _ = fuse_contact_predictions(
+                cont, torch.stack(view_predictions, dim=1), multiview_frame_valid,
+                original_weight=self.multiview_original_weight,
+                trim_fraction=self.multiview_trim_fraction,
+                min_positive_iou=self.multiview_min_positive_iou,
+                min_agreeing_frames=self.multiview_min_agreeing_frames,
+            )
         time_taken = time.time() - initial_time
 
         if self.context:

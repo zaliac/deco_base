@@ -3,7 +3,7 @@ PROJECT_NAME: 'DECO_DAMON_Testing'
 OUTPUT_DIR: 'deco_results'
 CONDOR_DIR: ''
 DATASET:
-  BATCH_SIZE: 16
+  BATCH_SIZE: 1      # 16
   NUM_WORKERS: 4
   NORMALIZE_IMAGES: [True]
 OPTIMIZER:
@@ -11,7 +11,7 @@ OPTIMIZER:
   LR: [5e-5]
   NUM_UPDATE_LR: 3
 TRAINING:
-  ENCODER: 'hrnet'
+  ENCODER: 'sam_sam'     # matches checkpoints/demo_train_best.pth
   CONTEXT: [True]
   NUM_EPOCHS: 1
   NUM_EARLY_STOP: 10
@@ -19,10 +19,20 @@ TRAINING:
   CHECKPOINT_EPOCHS: 5
   DATASETS: ['damon']
   DATASET_MIX_PDF: ['1.']
-  DATASET_ROOT_PATH: ''
-  BEST_MODEL_PATH: './checkpoints/Release_Checkpoint/deco_best.pth'
+  DATASET_ROOT_PATH: '/home/l_z80934/scratch/deco'
+  BEST_MODEL_PATH: './checkpoints/demo_train_best.pth'
   PAL_LOSS_WEIGHTS: 0.0
 VALIDATION:
   SUMMARY_STEPS: 1000
   DATASETS: ['damon']
   MAIN_DATASET: 'damon'
+TEST_TIME:
+  # First establish the checkpoint-compatible original-only baseline. Enable
+  # gated Task-7 TTA with: --opts TEST_TIME.MULTIVIEW_ENABLED True
+  MULTIVIEW_ENABLED: False
+  FRAMES_ROOT: '/home/l_z80934/scratch/deco/datasets/HOT-Annotated/frames'
+  NUM_FRAMES: 21
+  ENSEMBLE_ORIGINAL_WEIGHT: 2.0
+  ENSEMBLE_TRIM_FRACTION: 0.2
+  MULTIVIEW_MIN_POSITIVE_IOU: 0.5
+  MULTIVIEW_MIN_AGREEING_FRAMES: 3

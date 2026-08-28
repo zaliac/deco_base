@@ -36,6 +36,8 @@ class BaseDataset(Dataset):
             model_type='smpl',
             dataset_root_path='',
             normalize=False,
+            multiview_frames_root=None,
+            multiview_num_frames=21,
             generate_object_masks=False,
             sam_checkpoint_path=None,
             sam_model_type='vit_b',
@@ -163,6 +165,16 @@ class BaseDataset(Dataset):
 
         self.normalize = normalize
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
+        # Task 7: every DAMON test image optionally has 21 rendered views in
+        # ``<frames_root>/<original-stem>/frame_000.png ... frame_020.png``.
+        # Keep this opt-in so training and non-DAMON evaluation do no extra I/O.
+        self.multiview_frames_root = (
+            Path(multiview_frames_root).expanduser()
+            if multiview_frames_root else None
+        )
+        self.multiview_num_frames = int(multiview_num_frames)
+        if self.multiview_frames_root is not None and self.multiview_num_frames < 1:
+            raise ValueError('multiview_num_frames must be positive when frames are enabled')
 
     def _get_sam_predictor(self):
         """Lazily obtain a SAM predictor for the per-keypoint circle prompts."""
@@ -350,6 +362,34 @@ class BaseDataset(Dataset):
         )
         return mask, has_object_mask
 
+    def _multiview_frames_for_image(self, image_name):
+        """Load the rendered Task-7 views, preserving a fixed collatable shape.
+
+        Missing or unreadable frames are represented by a zero tensor and a
+        false validity flag.  Evaluation then excludes them from the ensemble
+        instead of treating a black image as an observation.
+        """
+        count = self.multiview_num_frames
+        frames = np.zeros((count, 3, 256, 256), dtype=np.float32)
+        valid = np.zeros((count,), dtype=np.bool_)
+        if self.multiview_frames_root is None:
+            return frames, valid
+
+        frame_dir = self.multiview_frames_root / Path(str(image_name)).stem
+        for frame_index in range(count):
+            frame_path = frame_dir / f'frame_{frame_index:03d}.png'
+            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_CUBIC)
+            frame = frame.transpose(2, 0, 1) / 255.0
+            frame_tensor = torch.tensor(frame, dtype=torch.float32)
+            if self.normalize:
+                frame_tensor = self.normalize_img(frame_tensor)
+            frames[frame_index] = frame_tensor.numpy()
+            valid[frame_index] = True
+        return frames, valid
+
     def __getitem__(self, index):
         item = {}
 
@@ -498,6 +538,11 @@ class BaseDataset(Dataset):
         item['is_smplx'] = self.is_smplx[index]
         item['has_contact_3d'] = self.has_contact_3d[index]
         item['has_polygon_contact_2d'] = self.has_polygon_contact_2d[index]
+
+        if self.multiview_frames_root is not None:
+            frames, frame_valid = self._multiview_frames_for_image(self.images[index])
+            item['multiview_frames'] = torch.from_numpy(frames)
+            item['multiview_frame_valid'] = torch.from_numpy(frame_valid)
 
         return item
 

@@ -49,6 +49,20 @@ hparams.TRAINING.DISTILL_RAMP_STEPS = 2000     # warm distill terms 0->1 over th
 hparams.TRAINING.SAM_KEYPOINT_CIRCLE_RADIUS = 12.0
 hparams.TRAINING.SAM_KEYPOINT_CIRCLE_POINTS = 8
 
+# Task 7: original DAMON test image + 21 pre-rendered camera views.  The
+# original remains an anchor; rendered logits are robustly trimmed before fusion.
+hparams.TEST_TIME = CN()
+hparams.TEST_TIME.MULTIVIEW_ENABLED = False
+hparams.TEST_TIME.FRAMES_ROOT = '/home/l_z80934/scratch/deco/datasets/HOT-Annotated/frames'
+hparams.TEST_TIME.NUM_FRAMES = 21
+hparams.TEST_TIME.ENSEMBLE_ORIGINAL_WEIGHT = 2.0
+hparams.TEST_TIME.ENSEMBLE_TRIM_FRACTION = 0.2
+# Synthetic body renders omit much of the scene context used by DECO. A frame
+# is eligible for fusion only when its positive contact set agrees with the
+# original-image prediction, otherwise augmentation abstains.
+hparams.TEST_TIME.MULTIVIEW_MIN_POSITIVE_IOU = 0.5
+hparams.TEST_TIME.MULTIVIEW_MIN_AGREEING_FRAMES = 3
+
 # Training hparams
 hparams.VALIDATION = CN()
 hparams.VALIDATION.SUMMARY_STEPS = 100
